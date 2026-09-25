@@ -1,0 +1,2534 @@
+diff --git a/build.zig b/build.zig
+index 0bd1abe0..0fd356ce 100644
+--- a/build.zig
++++ b/build.zig
+@@ -400,6 +400,25 @@ pub fn build(b: *std.Build) !void {
+     exe_options.addOption(bool, "enable_tracy_allocation", tracy_allocation);
+     exe_options.addOption(u32, "tracy_callstack_depth", tracy_callstack_depth);
+     exe_options.addOption(bool, "value_tracing", value_tracing);
++
++    const compiler_api_mod = b.addModule("compiler_api", .{
++        .root_source_file = b.path("src/compiler_api.zig"),
++    });
++    compiler_api_mod.addOptions("build_options", exe_options);
++
++    const install_compiler_api_src = b.addInstallDirectory(.{
++        .source_dir = b.path("src"),
++        .install_dir = .lib,
++        .install_subdir = "zig/compiler-api/src",
++    });
++    const install_compiler_api_options = b.addInstallFileWithDir(
++        exe_options.getOutput(),
++        .lib,
++        "zig/compiler-api/build_options.zig",
++    );
++    b.getInstallStep().dependOn(&install_compiler_api_src.step);
++    b.getInstallStep().dependOn(&install_compiler_api_options.step);
++
+     if (tracy) |tracy_dir| {
+         const tracy_mod = b.createModule(.{
+             .target = target,
+@@ -850,6 +869,7 @@ fn addCompilerMod(b: *std.Build, options: AddCompilerModOptions) *std.Build.Modu
+ fn addCompilerStep(b: *std.Build, options: AddCompilerModOptions) *std.Build.Step.Compile {
+     const exe = b.addExecutable(.{
+         .name = "zig",
++        .zig_lib_dir = b.path("lib"),
+         // This number should never be raised. If the value is exceeded, then
+         // it is considered a bug in the Zig project that building the
+         // compiler takes more than 8G of memory.
+diff --git a/lib/compiler/Maker.zig b/lib/compiler/Maker.zig
+index b5db0e68..f1543dcb 100644
+--- a/lib/compiler/Maker.zig
++++ b/lib/compiler/Maker.zig
+@@ -22,6 +22,8 @@ const Color = std.zig.Color;
+ const EnvVar = std.zig.EnvVar;
+ const default_local_zig_cache_basename = std.zig.default_local_zig_cache_basename;
+ const stringToEnum = std.meta.stringToEnum;
++const compiler_source_identity = "tiny.zig.source.identity";
++const compiler_fork_identity = "tiny.zig.fork.identity";
+
+ const Fuzz = @import("Maker/Fuzz.zig");
+ const Graph = @import("Maker/Graph.zig");
+@@ -595,6 +597,8 @@ pub fn main(init: process.Init.Minimal) !void {
+     comptime assert(3 == @backingInt(std.zig.Server.Message.PathPrefix.global_cache));
+
+     graph.cache.hash.addBytes(builtin.zig_version_string);
++    graph.cache.hash.addBytes(compiler_source_identity);
++    graph.cache.hash.addBytes(compiler_fork_identity);
+
+     const NO_COLOR = EnvVar.NO_COLOR.isSet(&graph.environ_map);
+     const CLICOLOR_FORCE = EnvVar.CLICOLOR_FORCE.isSet(&graph.environ_map);
+diff --git a/lib/compiler/Maker/Step/Compile.zig b/lib/compiler/Maker/Step/Compile.zig
+index adf88b9f..3fc6cf0c 100644
+--- a/lib/compiler/Maker/Step/Compile.zig
++++ b/lib/compiler/Maker/Step/Compile.zig
+@@ -11,6 +11,14 @@ const Io = std.Io;
+ const Sha256 = std.crypto.hash.sha2.Sha256;
+ const assert = std.debug.assert;
+
++const stardust_build_plugin_env = "TINY_STARDUST_BUILD_PLUGIN";
++const stardust_build_session_dir_env = "TINY_STARDUST_BUILD_SESSION_DIR";
++const stardust_build_registered_root_env = "TINY_STARDUST_REGISTERED_ROOT";
++const stardust_build_repository_root_env = "TINY_STARDUST_REPOSITORY_ROOT";
++const stardust_unit_json_bytes_max = 64 * 1024;
++const stardust_unit_path_bytes_max = 1024;
++const stardust_unit_text_bytes_max = 512;
++
+ const Step = @import("../Step.zig");
+ const Maker = @import("../../Maker.zig");
+ const PkgConfig = @import("../PkgConfig.zig");
+@@ -42,7 +50,15 @@ pub fn make(
+     var argv: std.ArrayList([]const u8) = .empty;
+     defer argv.deinit(gpa);
+
+-    try lowerZigArgs(arena, compile, compile_index, maker, progress_node, &argv, false);
++    const stardust_ticket = try lowerZigArgs(
++        arena,
++        compile,
++        compile_index,
++        maker,
++        progress_node,
++        &argv,
++        false,
++    );
+
+     const incremental = conf_comp.flags4.incremental.toBool() orelse graph.incremental == true;
+
+@@ -55,11 +71,14 @@ pub fn make(
+     ) catch |err| switch (err) {
+         error.NeedCompileErrorCheck => {
+             try checkCompileErrors(arena, maker, compile_index);
++            if (stardust_ticket) |ticket| try ticket.markExpectedCompileError(maker, compile_index);
+             return;
+         },
+         else => |e| return e,
+     };
+
++    if (stardust_ticket) |ticket| try ticket.requireArtifact(maker, compile_index);
++
+     const root_module = conf_comp.root_module.get(conf);
+     const target = root_module.resolved_target.get(conf).?.result.get(conf);
+
+@@ -149,6 +168,572 @@ const ModuleListContext = struct {
+     };
+ };
+
++const StardustBuildTicket = struct {
++    plugin_path: ?[]const u8,
++    artifact_path: ?[]const u8,
++    expected_compile_error_path: ?[]const u8,
++
++    fn appendObserverArgs(
++        ticket: StardustBuildTicket,
++        arena: Allocator,
++        gpa: Allocator,
++        zig_args: *std.ArrayList([]const u8),
++    ) Allocator.Error!void {
++        const artifact_path = ticket.artifact_path orelse return;
++        try zig_args.appendSlice(gpa, &.{
++            try arena.print("-fstardust-plugin={s}", .{ticket.plugin_path.?}),
++            try arena.print("-fstardust-output={s}", .{artifact_path}),
++        });
++    }
++
++    fn observerArgsLength(ticket: StardustBuildTicket) usize {
++        const artifact_path = ticket.artifact_path orelse return 0;
++        return "-fstardust-plugin=".len + ticket.plugin_path.?.len + 1 +
++            "-fstardust-output=".len + artifact_path.len + 1;
++    }
++
++    fn markExpectedCompileError(
++        ticket: StardustBuildTicket,
++        maker: *Maker,
++        compile_index: Configuration.Step.Index,
++    ) Step.ExtendedMakeError!void {
++        const terminal_path = ticket.expected_compile_error_path orelse
++            return maker.stepByIndex(compile_index).fail(
++                maker,
++                "Stardust build ticket expected an artifact, not a compile error",
++                .{},
++            );
++        const io = maker.graph.io;
++        const terminal = Dir.cwd().createFile(io, terminal_path, .{}) catch |err|
++            return maker.stepByIndex(compile_index).fail(
++                maker,
++                "failed creating Stardust build terminal {q}: {t}",
++                .{ terminal_path, err },
++            );
++        terminal.close(io);
++    }
++
++    fn requireArtifact(
++        ticket: StardustBuildTicket,
++        maker: *Maker,
++        compile_index: Configuration.Step.Index,
++    ) Step.ExtendedMakeError!void {
++        const artifact_path = ticket.artifact_path orelse
++            return maker.stepByIndex(compile_index).fail(
++                maker,
++                "Stardust build expected a compile error but compilation succeeded",
++                .{},
++            );
++        const stat = Dir.cwd().statFile(maker.graph.io, artifact_path, .{
++            .follow_symlinks = false,
++        }) catch |err| return maker.stepByIndex(compile_index).fail(
++            maker,
++            "Stardust build compiler produced no artifact at {q}: {t}",
++            .{ artifact_path, err },
++        );
++        if (stat.kind != .file or stat.size == 0) {
++            return maker.stepByIndex(compile_index).fail(
++                maker,
++                "Stardust build artifact {q} must be a non-empty regular file; found {t} with {d} bytes",
++                .{ artifact_path, stat.kind, stat.size },
++            );
++        }
++    }
++};
++
++const StardustCompileKind = enum(u3) {
++    @"test",
++    test_obj,
++    exe,
++    lib,
++    obj,
++};
++
++const StardustOptimizeMode = enum(u2) {
++    debug,
++    safe,
++    fast,
++    small,
++};
++
++const StardustUnit = struct {
++    schema: u32,
++    registered_root: []const u8,
++    build_root: []const u8,
++    root_source: []const u8,
++    root_name: []const u8,
++    kind: StardustCompileKind,
++    target: []const u8,
++    cpu: []const u8,
++    object_format: []const u8,
++    dynamic_linker: ?[]const u8,
++    optimize: StardustOptimizeMode,
++};
++
++const StardustBuildIdentity = [Sha256.digest_length * 2]u8;
++
++fn stardustBuildIdentity(
++    maker: *const Maker,
++    compile_index: Configuration.Step.Index,
++    plugin_path: []const u8,
++    zig_args: []const []const u8,
++) StardustBuildIdentity {
++    const graph = maker.graph;
++    var hasher = Sha256.init(.{});
++    updateStardustBuildIdentity(&hasher, "tiny.stardust.build-ticket/v2");
++    updateStardustBuildIdentity(
++        &hasher,
++        graph.build_root_directory.path orelse graph.cache.cwd,
++    );
++    updateStardustBuildIdentity(&hasher, plugin_path);
++    const compile_index_int: u32 = @backingInt(compile_index);
++    hasher.update(mem.asBytes(&compile_index_int));
++    for (zig_args) |arg| updateStardustBuildIdentity(&hasher, arg);
++
++    var identity: [Sha256.digest_length]u8 = undefined;
++    hasher.final(&identity);
++    var identity_hex: StardustBuildIdentity = undefined;
++    _ = std.fmt.bufPrint(&identity_hex, "{x}", .{&identity}) catch unreachable;
++    return identity_hex;
++}
++
++fn markStardustGeneratedRootSkipped(
++    arena: Allocator,
++    maker: *Maker,
++    compile_index: Configuration.Step.Index,
++    session_dir: []const u8,
++    identity: StardustBuildIdentity,
++) Step.ExtendedMakeError!void {
++    const marker_path = try Dir.path.join(arena, &.{
++        session_dir,
++        try arena.print("{s}.generated_root_skipped", .{identity}),
++    });
++    const marker = Dir.cwd().createFile(maker.graph.io, marker_path, .{}) catch |err|
++        return maker.stepByIndex(compile_index).fail(
++            maker,
++            "failed creating Stardust generated-root skip marker {q}: {t}",
++            .{ marker_path, err },
++        );
++    marker.close(maker.graph.io);
++}
++
++fn prepareStardustBuildTicket(
++    arena: Allocator,
++    compile_index: Configuration.Step.Index,
++    maker: *Maker,
++    zig_args: *std.ArrayList([]const u8),
++    fuzz: bool,
++) Step.ExtendedMakeError!?StardustBuildTicket {
++    const graph = maker.graph;
++    const plugin_path = graph.environ_map.get(stardust_build_plugin_env);
++    const session_dir = graph.environ_map.get(stardust_build_session_dir_env);
++    const registered_root = graph.environ_map.get(stardust_build_registered_root_env);
++    const repository_root = graph.environ_map.get(stardust_build_repository_root_env);
++    if (plugin_path == null and
++        session_dir == null and
++        registered_root == null and
++        repository_root == null)
++    {
++        return null;
++    }
++
++    const step = maker.stepByIndex(compile_index);
++    if (plugin_path == null or
++        session_dir == null or
++        registered_root == null or
++        repository_root == null)
++    {
++        return step.fail(
++            maker,
++            "Stardust build session requires {s}, {s}, {s}, and {s}",
++            .{
++                stardust_build_plugin_env,
++                stardust_build_session_dir_env,
++                stardust_build_registered_root_env,
++                stardust_build_repository_root_env,
++            },
++        );
++    }
++    if (!Dir.path.isAbsolute(plugin_path.?) or
++        !Dir.path.isAbsolute(session_dir.?) or
++        !Dir.path.isAbsolute(repository_root.?))
++    {
++        return step.fail(
++            maker,
++            "Stardust build session paths must be absolute: {s}={q} {s}={q} {s}={q}",
++            .{
++                stardust_build_plugin_env,
++                plugin_path.?,
++                stardust_build_session_dir_env,
++                session_dir.?,
++                stardust_build_repository_root_env,
++                repository_root.?,
++            },
++        );
++    }
++    if (!stardustUnitToken(registered_root.?)) return step.fail(
++        maker,
++        "Stardust build registered root {q} is not a stable token",
++        .{registered_root.?},
++    );
++    if (maker.web_server != null or graph.fuzzing or fuzz) {
++        return step.fail(maker, "Stardust build sessions do not support web or fuzzing modes", .{});
++    }
++
++    const conf = &maker.scanned_config.configuration;
++    const conf_comp = compile_index.ptr(conf).extended.get(conf.extra).compile;
++    const root_module = conf_comp.root_module.get(conf);
++    const root_source_index = root_module.root_source_file.unwrap() orelse return null;
++    const identity_hex = stardustBuildIdentity(
++        maker,
++        compile_index,
++        plugin_path.?,
++        zig_args.items,
++    );
++    switch (root_source_index.get(conf)) {
++        .generated => {
++            try markStardustGeneratedRootSkipped(
++                arena,
++                maker,
++                compile_index,
++                session_dir.?,
++                identity_hex,
++            );
++            return null;
++        },
++        else => {},
++    }
++
++    const repository_root_real_z = Dir.realPathFileAbsoluteAlloc(
++        graph.io,
++        repository_root.?,
++        arena,
++    ) catch |err| return step.fail(
++        maker,
++        "failed canonicalizing Stardust repository root {q}: {t}",
++        .{ repository_root.?, err },
++    );
++    const repository_root_real = repository_root_real_z[0..repository_root_real_z.len];
++    if (!mem.eql(u8, repository_root.?, repository_root_real)) return step.fail(
++        maker,
++        "Stardust repository root is not canonical: supplied {q}, canonical {q}",
++        .{ repository_root.?, repository_root_real },
++    );
++    const build_root_input = graph.build_root_directory.path orelse graph.cache.cwd;
++    const build_root_real_z = Dir.cwd().realPathFileAlloc(
++        graph.io,
++        build_root_input,
++        arena,
++    ) catch |err| return step.fail(
++        maker,
++        "failed canonicalizing Stardust build root {q}: {t}",
++        .{ build_root_input, err },
++    );
++    const root_source_input = try maker.resolveLazyPathIndexAbs(
++        arena,
++        root_source_index,
++        compile_index,
++    );
++    const cwd_real_z = Dir.cwd().realPathFileAlloc(
++        graph.io,
++        ".",
++        arena,
++    ) catch |err| return step.fail(
++        maker,
++        "failed canonicalizing Stardust compiler working directory: {t}",
++        .{err},
++    );
++    const root_source_expected = try Dir.path.resolve(arena, &.{
++        cwd_real_z[0..cwd_real_z.len],
++        root_source_input,
++    });
++    const root_source_real_z = Dir.cwd().realPathFileAlloc(
++        graph.io,
++        root_source_input,
++        arena,
++    ) catch |err| return step.fail(
++        maker,
++        "failed canonicalizing Stardust root source {q}: {t}",
++        .{ root_source_input, err },
++    );
++    const root_source_real = root_source_real_z[0..root_source_real_z.len];
++    if (!mem.eql(u8, root_source_expected, root_source_real)) return step.fail(
++        maker,
++        "Stardust root source is not canonical: supplied {q}, expected {q}, actual {q}",
++        .{ root_source_input, root_source_expected, root_source_real },
++    );
++    const build_root = try stardustRepositoryRelativePath(
++        arena,
++        repository_root_real,
++        build_root_real_z[0..build_root_real_z.len],
++        true,
++    ) orelse return step.fail(
++        maker,
++        "Stardust build root {q} is outside repository {q}",
++        .{ build_root_real_z, repository_root_real },
++    );
++    const root_source = try stardustRepositoryRelativePath(
++        arena,
++        repository_root_real,
++        root_source_real,
++        false,
++    ) orelse return step.fail(
++        maker,
++        "Stardust root source {q} is outside repository {q}",
++        .{ root_source_real, repository_root_real },
++    );
++    if (!mem.endsWith(u8, root_source, ".zig") or stardustGeneratedPath(root_source)) {
++        return step.fail(
++            maker,
++            "Stardust root source {q} must be a stable repository Zig source",
++            .{root_source},
++        );
++    }
++
++    const root_name = conf_comp.root_name.slice(conf);
++    const target = conf_comp.rootModuleTarget(conf).unwrapTarget(conf);
++    const target_query = std.Target.Query.fromTarget(&target);
++    const target_text = try target_query.zigTriple(arena);
++    const cpu_text = try target_query.serializeCpuAlloc(arena);
++    const object_format = @tagName(target.ofmt);
++    const dynamic_linker = target.dynamic_linker.get();
++    if (!stardustUnitText(root_name, stardust_unit_text_bytes_max) or
++        !stardustUnitText(target_text, stardust_unit_text_bytes_max) or
++        !stardustUnitText(cpu_text, stardust_unit_text_bytes_max) or
++        !stardustUnitToken(object_format) or
++        (dynamic_linker != null and
++            !stardustUnitText(dynamic_linker.?, stardust_unit_path_bytes_max)))
++    {
++        return step.fail(
++            maker,
++            "Stardust build unit context exceeds the stable schema",
++            .{},
++        );
++    }
++    const unit = StardustUnit{
++        .schema = 1,
++        .registered_root = registered_root.?,
++        .build_root = build_root,
++        .root_source = root_source,
++        .root_name = root_name,
++        .kind = switch (conf_comp.flags3.kind) {
++            .@"test" => .@"test",
++            .test_obj => .test_obj,
++            .exe => .exe,
++            .lib => .lib,
++            .obj => .obj,
++        },
++        .target = target_text,
++        .cpu = cpu_text,
++        .object_format = object_format,
++        .dynamic_linker = dynamic_linker,
++        .optimize = switch (root_module.flags.optimize) {
++            .debug, .default => .debug,
++            .safe => .safe,
++            .fast => .fast,
++            .small => .small,
++        },
++    };
++
++    const expected_path = try Dir.path.join(arena, &.{
++        session_dir.?,
++        try arena.print("{s}.expected", .{identity_hex}),
++    });
++    const artifact_path = try Dir.path.join(arena, &.{
++        session_dir.?,
++        try arena.print("{s}.choir", .{identity_hex}),
++    });
++    const expected_compile_error_path = try Dir.path.join(arena, &.{
++        session_dir.?,
++        try arena.print("{s}.expected_compile_error", .{identity_hex}),
++    });
++    const unit_path = try Dir.path.join(arena, &.{
++        session_dir.?,
++        try arena.print("{s}.unit.json", .{identity_hex}),
++    });
++    try clearStardustArtifactFamily(
++        maker,
++        compile_index,
++        session_dir.?,
++        Dir.path.basename(artifact_path),
++    );
++    Dir.cwd().deleteFile(graph.io, expected_compile_error_path) catch |err| switch (err) {
++        error.FileNotFound => {},
++        else => return step.fail(
++            maker,
++            "failed clearing stale Stardust compile-error terminal {q}: {t}",
++            .{ expected_compile_error_path, err },
++        ),
++    };
++
++    var unit_storage: [stardust_unit_json_bytes_max]u8 = undefined;
++    var unit_writer: std.Io.Writer = .fixed(&unit_storage);
++    std.json.Stringify.value(unit, .{}, &unit_writer) catch |err| return step.fail(
++        maker,
++        "failed encoding Stardust build unit context: {t}",
++        .{err},
++    );
++    const unit_file = Dir.cwd().createFile(graph.io, unit_path, .{}) catch |err|
++        return step.fail(
++            maker,
++            "failed creating Stardust build unit context {q}: {t}",
++            .{ unit_path, err },
++        );
++    defer unit_file.close(graph.io);
++    unit_file.writeStreamingAll(graph.io, unit_writer.buffered()) catch |err|
++        return step.fail(
++            maker,
++            "failed writing Stardust build unit context {q}: {t}",
++            .{ unit_path, err },
++        );
++
++    const expected = Dir.cwd().createFile(graph.io, expected_path, .{}) catch |err|
++        return step.fail(
++            maker,
++            "failed creating Stardust build expectation {q}: {t}",
++            .{ expected_path, err },
++        );
++    expected.close(graph.io);
++
++    if (conf_comp.flags4.expect_errors != .none) return .{
++        .plugin_path = null,
++        .artifact_path = null,
++        .expected_compile_error_path = expected_compile_error_path,
++    };
++
++    return .{
++        .plugin_path = plugin_path.?,
++        .artifact_path = artifact_path,
++        .expected_compile_error_path = null,
++    };
++}
++
++fn clearStardustArtifactFamily(
++    maker: *Maker,
++    compile_index: Configuration.Step.Index,
++    session_dir: []const u8,
++    artifact_basename: []const u8,
++) Step.ExtendedMakeError!void {
++    const io = maker.graph.io;
++    var directory = Dir.cwd().openDir(io, session_dir, .{
++        .iterate = true,
++        .follow_symlinks = false,
++    }) catch |err| return maker.stepByIndex(compile_index).fail(
++        maker,
++        "failed opening Stardust build session {q}: {t}",
++        .{ session_dir, err },
++    );
++    defer directory.close(io);
++
++    var iterator = directory.iterate();
++    while (iterator.next(io) catch |err| return maker.stepByIndex(compile_index).fail(
++        maker,
++        "failed scanning Stardust build session {q}: {t}",
++        .{ session_dir, err },
++    )) |entry| {
++        if (!mem.eql(u8, entry.name, artifact_basename) and
++            (!mem.startsWith(u8, entry.name, artifact_basename) or
++                entry.name.len == artifact_basename.len or
++                entry.name[artifact_basename.len] != '.'))
++        {
++            continue;
++        }
++        directory.deleteFile(io, entry.name) catch |err|
++            return maker.stepByIndex(compile_index).fail(
++                maker,
++                "failed clearing stale Stardust artifact {q}: {t}",
++                .{ entry.name, err },
++            );
++    }
++}
++
++fn updateStardustBuildIdentity(hasher: *Sha256, field: []const u8) void {
++    const field_len: u64 = field.len;
++    hasher.update(mem.asBytes(&field_len));
++    hasher.update(field);
++}
++
++fn stardustRepositoryRelativePath(
++    arena: Allocator,
++    repository_root: []const u8,
++    absolute_path: []const u8,
++    allow_dot: bool,
++) Allocator.Error!?[]const u8 {
++    if (mem.eql(u8, repository_root, absolute_path)) {
++        return if (allow_dot) "." else null;
++    }
++    if (!mem.startsWith(u8, absolute_path, repository_root)) return null;
++    var relative = absolute_path[repository_root.len..];
++    if (repository_root.len == 0 or
++        !Dir.path.isSep(repository_root[repository_root.len - 1]))
++    {
++        if (relative.len == 0 or !Dir.path.isSep(relative[0])) return null;
++        relative = relative[1..];
++    }
++    if (relative.len == 0 or relative.len > stardust_unit_path_bytes_max) return null;
++    const normalized = try arena.dupe(u8, relative);
++    for (normalized) |*byte| {
++        if (Dir.path.isSep(byte.*)) byte.* = '/';
++    }
++    if (!stardustUnitPath(normalized, allow_dot)) return null;
++    return normalized;
++}
++
++fn stardustUnitPath(path: []const u8, allow_dot: bool) bool {
++    if (path.len == 0 or path.len > stardust_unit_path_bytes_max) return false;
++    if (allow_dot and mem.eql(u8, path, ".")) return true;
++    if (Dir.path.isAbsolute(path) or mem.indexOfScalar(u8, path, '\\') != null) {
++        return false;
++    }
++    var segments = mem.splitScalar(u8, path, '/');
++    while (segments.next()) |segment| {
++        if (segment.len == 0 or
++            mem.eql(u8, segment, ".") or
++            mem.eql(u8, segment, "..") or
++            !stardustUnitText(segment, stardust_unit_path_bytes_max))
++        {
++            return false;
++        }
++    }
++    return true;
++}
++
++fn stardustUnitToken(value: []const u8) bool {
++    if (value.len == 0 or value.len > stardust_unit_text_bytes_max) return false;
++    for (value) |byte| {
++        if (!std.ascii.isAlphanumeric(byte) and
++            byte != '-' and
++            byte != '_' and
++            byte != '.' and
++            byte != '+')
++        {
++            return false;
++        }
++    }
++    return true;
++}
++
++fn stardustUnitText(value: []const u8, bytes_max: usize) bool {
++    if (value.len == 0 or value.len > bytes_max) return false;
++    for (value) |byte| {
++        if (byte < 0x20 or byte > 0x7e) return false;
++    }
++    return true;
++}
++
++fn stardustGeneratedPath(path: []const u8) bool {
++    var segments = mem.splitScalar(u8, path, '/');
++    while (segments.next()) |segment| {
++        if (mem.eql(u8, segment, ".zig-cache") or
++            mem.eql(u8, segment, "zig-cache") or
++            mem.eql(u8, segment, "zig-out"))
++        {
++            return true;
++        }
++    }
++    return false;
++}
++
+ fn lowerZigArgs(
+     arena: Allocator,
+     compile: *Compile,
+@@ -157,7 +742,7 @@ fn lowerZigArgs(
+     progress_node: std.Progress.Node,
+     zig_args: *std.ArrayList([]const u8),
+     fuzz: bool,
+-) Step.ExtendedMakeError!void {
++) Step.ExtendedMakeError!?StardustBuildTicket {
+     const step = maker.stepByIndex(compile_index);
+     const graph = maker.graph;
+     const gpa = maker.gpa;
+@@ -848,6 +1433,14 @@ fn lowerZigArgs(
+
+     try zig_args.append(gpa, "--listen=-");
+
++    const stardust_ticket = try prepareStardustBuildTicket(
++        arena,
++        compile_index,
++        maker,
++        zig_args,
++        fuzz,
++    );
++
+     // Windows has an argument length limit of 32,766 characters, macOS 262,144 and Linux
+     // 2,097,152. If our args exceed 30 KiB, we instead write them to a "response file" and
+     // pass that to zig, e.g. via 'zig build-lib @args.rsp'
+@@ -856,6 +1449,7 @@ fn lowerZigArgs(
+     for (zig_args.items) |arg| {
+         args_length += arg.len + 1; // +1 to account for null terminator
+     }
++    if (stardust_ticket) |ticket| args_length += ticket.observerArgsLength();
+     if (args_length >= 30 * 1024) {
+         const local_cache_root = graph.local_cache_root;
+         const args_path: Path = .{ .root_dir = local_cache_root, .sub_path = "args" };
+@@ -927,6 +1521,8 @@ fn lowerZigArgs(
+         zig_args.shrinkRetainingCapacity(2);
+         try zig_args.append(gpa, resolved_args_file);
+     }
++    if (stardust_ticket) |ticket| try ticket.appendObserverArgs(arena, gpa, zig_args);
++    return stardust_ticket;
+ }
+
+ pub fn rebuildInFuzzMode(
+@@ -953,7 +1549,7 @@ pub fn rebuildInFuzzMode(
+     var argv: std.ArrayList([]const u8) = .empty;
+     defer argv.deinit(gpa);
+
+-    try lowerZigArgs(arena, compile, compile_index, maker, progress_node, &argv, true);
++    _ = try lowerZigArgs(arena, compile, compile_index, maker, progress_node, &argv, true);
+     const maybe_output_bin_path = try Step.evalZigProcess(compile_index, maker, argv.items, progress_node, false);
+     return maybe_output_bin_path.?;
+ }
+diff --git a/lib/std/zig/AstGen.zig b/lib/std/zig/AstGen.zig
+index c865bd92..0b31f70c 100644
+--- a/lib/std/zig/AstGen.zig
++++ b/lib/std/zig/AstGen.zig
+@@ -9063,6 +9063,23 @@ fn builtinCall(
+             const result = try gz.addExtendedMultiOpPayloadIndex(.compile_log, payload_index, params.len);
+             return rvalue(gz, ri, result, node);
+         },
++        .stardust_claim => {
++            const payload_index = try addExtra(gz.astgen, Zir.Inst.NodeMultiOp{
++                .src_node = gz.nodeIndexToRelative(node),
++            });
++            var extra_index = try reserveExtra(gz.astgen, params.len);
++            for (params) |param| {
++                const param_ref = try expr(gz, scope, .{ .rl = .none }, param);
++                astgen.extra.items[extra_index] = @backingInt(param_ref);
++                extra_index += 1;
++            }
++            const result = try gz.addExtendedMultiOpPayloadIndex(
++                .stardust_claim,
++                payload_index,
++                params.len,
++            );
++            return rvalue(gz, ri, result, node);
++        },
+         .field => {
+             switch (ri.rl) {
+                 .ref, .ref_coerced_ty => {
+diff --git a/lib/std/zig/AstRlAnnotate.zig b/lib/std/zig/AstRlAnnotate.zig
+index 4e010dee..67a06486 100644
+--- a/lib/std/zig/AstRlAnnotate.zig
++++ b/lib/std/zig/AstRlAnnotate.zig
+@@ -811,7 +811,7 @@ fn builtinCall(astrl: *AstRlAnnotate, block: ?*Block, ri: ResultInfo, node: Ast.
+             _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+             return false;
+         },
+-        .compile_log, .TypeOf => {
++        .compile_log, .stardust_claim, .TypeOf => {
+             for (args) |arg_node| {
+                 _ = try astrl.expr(arg_node, block, ResultInfo.none);
+             }
+diff --git a/lib/std/zig/BuiltinFn.zig b/lib/std/zig/BuiltinFn.zig
+index 99ac5ce5..9799b01b 100644
+--- a/lib/std/zig/BuiltinFn.zig
++++ b/lib/std/zig/BuiltinFn.zig
+@@ -127,6 +127,7 @@ pub const Tag = enum {
+     work_item_id,
+     work_group_size,
+     work_group_id,
++    stardust_claim,
+ };
+
+ pub const EvalToError = enum {
+@@ -1038,6 +1039,13 @@ pub const list = list: {
+                 .param_count = 2,
+             },
+         },
++        .{
++            "@stardustClaim",
++            .{
++                .tag = .stardust_claim,
++                .param_count = 7,
++            },
++        },
+         .{
+             "@volatileCast",
+             .{
+diff --git a/lib/std/zig/Zir.zig b/lib/std/zig/Zir.zig
+index 1ec523e8..3d4a0e6e 100644
+--- a/lib/std/zig/Zir.zig
++++ b/lib/std/zig/Zir.zig
+@@ -2186,6 +2186,10 @@ pub const Inst = struct {
+         /// For example: Provided with `error{Foo}!?f64`, returns `f64`.
+         /// `operand` is payload index to `UnNode`.
+         float_op_result_ty,
++        /// Records one compiler observer claim without creating runtime demand.
++        /// `operand` is payload index to `NodeMultiOp`.
++        /// `small` is `operands_len`.
++        stardust_claim,
+
+         pub const InstData = struct {
+             opcode: Extended,
+@@ -4385,6 +4389,7 @@ fn findTrackableInner(
+                 .@"asm",
+                 .asm_expr,
+                 .compile_log,
++                .stardust_claim,
+                 .min_multi,
+                 .max_multi,
+                 .add_with_overflow,
+diff --git a/src/Compilation.zig b/src/Compilation.zig
+index d62856b0..59c1fe4c 100644
+--- a/src/Compilation.zig
++++ b/src/Compilation.zig
+@@ -43,6 +43,8 @@ const Builtin = @import("Builtin.zig");
+ const LlvmObject = @import("codegen/llvm.zig").Object;
+ const dev = @import("dev.zig");
+ const Module = @import("Module.zig");
++const stardust = @import("stardust.zig");
++const stardust_api = @import("stardust_api.zig");
+
+ pub const Config = @import("Compilation/Config.zig");
+
+@@ -73,6 +75,7 @@ config: Config,
+ /// In `CacheMode.none` and `CacheMode.incremental`, this is long-lived.
+ /// Regardless of cache mode, this is `null` when `-fno-emit-bin` is used.
+ bin_file: ?*link.File,
++stardust_plugin: ?stardust.Plugin,
+
+ /// The root path for the dynamic linker and system libraries (as well as frameworks on Darwin)
+ sysroot: ?[]const u8,
+@@ -1172,6 +1175,7 @@ pub const MiscTask = enum {
+     link_depfile,
+     docs_copy,
+     docs_wasm,
++    stardust_plugin,
+
+     @"musl crt1.o",
+     @"musl rcrt1.o",
+@@ -1644,6 +1648,7 @@ pub const CreateDiagnostic = union(enum) {
+     libc_installation_missing_crt_dir,
+     create_cache_path: CreateCachePath,
+     open_output_bin: link.File.OpenError,
++    open_stardust_plugin: stardust.OpenError,
+     pub const CreateCachePath = struct {
+         which: enum { local, global },
+         sub: []const u8,
+@@ -1663,6 +1668,7 @@ pub const CreateDiagnostic = union(enum) {
+                 cache.err,
+             }),
+             .open_output_bin => |err| try w.print("failed to open output binary: {t}", .{err}),
++            .open_stardust_plugin => |err| try w.print("failed to open Stardust plugin: {t}", .{err}),
+         }
+     }
+
+@@ -1941,6 +1947,8 @@ pub fn create(gpa: Allocator, arena: Allocator, io: Io, diag: *CreateDiagnostic,
+
+         // This is shared hasher state common to zig source and all C source files.
+         cache.hash.addBytes(build_options.version);
++        cache.hash.addBytes(stardust_api.source_identity);
++        cache.hash.addBytes(stardust_api.fork_identity);
+         cache.hash.add(builtin.zig_backend);
+         cache.hash.add(options.config.pie);
+         cache.hash.add(options.config.lto);
+@@ -2053,6 +2061,7 @@ pub fn create(gpa: Allocator, arena: Allocator, io: Io, diag: *CreateDiagnostic,
+             .zcu = opt_zcu,
+             .cache_use = undefined, // populated below
+             .bin_file = null, // populated below if necessary
++            .stardust_plugin = null,
+             .root_mod = options.root_mod,
+             .config = options.config,
+             .dirs = options.dirs,
+@@ -2320,6 +2329,18 @@ pub fn create(gpa: Allocator, arena: Allocator, io: Io, diag: *CreateDiagnostic,
+     };
+     errdefer comp.destroy();
+
++    if (comp.config.stardust_plugin_path) |plugin_path| {
++        comp.stardust_plugin = .empty;
++        if (comp.stardust_plugin) |*plugin| {
++            plugin.open(
++                plugin_path,
++                comp.config.stardust_output_path.?,
++                gpa,
++                io,
++            ) catch |err| return diag.fail(.{ .open_stardust_plugin = err });
++        } else unreachable;
++    }
++
+     if (target.ofmt == .c) return comp;
+
+     // Add a `CObject` for each `c_source_files`.
+@@ -2533,6 +2554,7 @@ pub fn destroy(comp: *Compilation) void {
+     const gpa = comp.gpa;
+     const io = comp.io;
+
++    if (comp.stardust_plugin) |*plugin| plugin.deinit();
+     if (comp.bin_file) |lf| lf.destroy();
+     if (comp.zcu) |zcu| zcu.deinit();
+     comp.cache_use.deinit(io);
+@@ -2711,6 +2733,17 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
+     const arena = arena_allocator.allocator();
+
+     comp.clearMiscFailures();
++
++    if (comp.stardust_plugin) |*plugin| {
++        plugin.beginUpdate() catch {
++            comp.setMiscFailure(
++                .stardust_plugin,
++                "Stardust plugin update reset failed: {f}",
++                .{plugin.failureCause()},
++            );
++            return;
++        };
++    }
+     comp.last_update_was_cache_hit = false;
+     if (comp.time_report) |*tr| {
+         tr.deinit(gpa); // this is information about an old update
+@@ -2792,6 +2825,16 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
+                 const bin_digest = man.finalBin();
+
+                 comp.digest = bin_digest;
++                if (comp.stardust_plugin) |*plugin| {
++                    plugin.restoreSnapshot(comp.dirs.local_cache, bin_digest) catch |err| {
++                        comp.setMiscFailure(
++                            .stardust_plugin,
++                            "failed restoring Stardust snapshot from the compilation cache: {t}",
++                            .{err},
++                        );
++                        return;
++                    };
++                }
+
+                 assert(whole.lock == null);
+                 whole.lock = man.toOwnedLock();
+@@ -3076,6 +3119,17 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
+             // cache manifest must not be written.
+             if (anyErrors(comp)) return;
+
++            if (comp.stardust_plugin) |*plugin| {
++                plugin.persistSnapshot(comp.dirs.local_cache, bin_digest) catch |err| {
++                    comp.setMiscFailure(
++                        .stardust_plugin,
++                        "failed storing Stardust snapshot in the compilation cache: {t}",
++                        .{err},
++                    );
++                    return;
++                };
++            }
++
+             // Failure here only means an unnecessary cache miss.
+             man.writeManifest() catch |err| log.warn("failed to write cache manifest: {t}", .{err});
+
+@@ -3238,6 +3292,15 @@ fn flush(comp: *Compilation, arena: Allocator) (Io.Cancelable || Allocator.Error
+             error.OutOfMemory, error.Canceled => |e| return e,
+         };
+     }
++    if (comp.stardust_plugin) |*plugin| {
++        if (comp.zcu) |zcu| {
++            plugin.flush(zcu, tid) catch comp.lockAndSetMiscFailure(
++                .stardust_plugin,
++                "Stardust plugin flush failed: {f}",
++                .{plugin.failureCause()},
++            );
++        }
++    }
+ }
+
+ /// This function is called by the frontend before flush(). It communicates that
+@@ -3294,14 +3357,21 @@ fn renameTmpIntoCache(
+ /// to remind the programmer to update multiple related pieces of code that
+ /// are in different locations. Bump this number when adding or deleting
+ /// anything from the link cache manifest.
+-pub const link_hash_implementation_version = 14;
++pub const link_hash_implementation_version = 15;
+
+ fn addNonIncrementalStuffToCacheManifest(
+     comp: *Compilation,
+     arena: Allocator,
+     man: *Cache.Manifest,
+ ) !void {
+-    comptime assert(link_hash_implementation_version == 14);
++    comptime assert(link_hash_implementation_version == 15);
++
++    if (comp.config.stardust_plugin_path) |plugin_path| {
++        _ = try man.addFile(plugin_path, null);
++        man.hash.add(comp.config.stardust_claim_metadata);
++        man.hash.addOptionalBytes(comp.environ_map.get("TINY_STARDUST_LIMITS"));
++        man.hash.addOptionalBytes(comp.environ_map.get("TINY_STARDUST_REPOSITORY_ROOT"));
++    }
+
+     if (comp.zcu) |zcu| {
+         try addModuleTableToCacheHash(zcu, arena, &man.hash, .{ .files = man });
+diff --git a/src/Compilation/Config.zig b/src/Compilation/Config.zig
+index 85915ded..a350385d 100644
+--- a/src/Compilation/Config.zig
++++ b/src/Compilation/Config.zig
+@@ -65,6 +65,9 @@ root_error_tracing: bool,
+ dll_export_fns: bool,
+ rdynamic: bool,
+ san_cov_trace_pc_guard: bool,
++stardust_plugin_path: ?[]const u8,
++stardust_output_path: ?[]const u8,
++stardust_claim_metadata: bool,
+
+ pub const CFrontend = enum { clang, aro };
+
+@@ -117,6 +120,9 @@ pub const Options = struct {
+     dll_export_fns: ?bool = null,
+     rdynamic: ?bool = null,
+     san_cov_trace_pc_guard: bool = false,
++    stardust_plugin_path: ?[]const u8 = null,
++    stardust_output_path: ?[]const u8 = null,
++    stardust_claim_metadata: bool = true,
+ };
+
+ pub const ResolveError = error{
+@@ -148,6 +154,7 @@ pub const ResolveError = error{
+     SanitizeThreadRequiresPie,
+     SanitizeThreadRequiresLlvmBackend,
+     BackendLacksErrorTracing,
++    StardustOutputRequiresPlugin,
+     LlvmLibraryUnavailable,
+     LldUnavailable,
+     ClangUnavailable,
+@@ -157,6 +164,9 @@ pub const ResolveError = error{
+ };
+
+ pub fn resolve(options: Options) ResolveError!Config {
++    if (options.stardust_output_path != null and options.stardust_plugin_path == null)
++        return error.StardustOutputRequiresPlugin;
++
+     const target = &options.resolved_target.result;
+
+     // WASI-only. Resolve the optional exec-model option, defaults to command.
+@@ -571,6 +581,12 @@ pub fn resolve(options: Options) ResolveError!Config {
+         .root_strip = root_strip,
+         .dll_export_fns = dll_export_fns,
+         .rdynamic = rdynamic,
++        .stardust_plugin_path = options.stardust_plugin_path,
++        .stardust_output_path = if (options.stardust_plugin_path != null)
++            options.stardust_output_path orelse "stardust.snapshot"
++        else
++            null,
++        .stardust_claim_metadata = options.stardust_claim_metadata,
+     };
+ }
+
+diff --git a/src/Sema.zig b/src/Sema.zig
+index 6dafdeb0..427d515d 100644
+--- a/src/Sema.zig
++++ b/src/Sema.zig
+@@ -36,6 +36,7 @@ const Cache = std.Build.Cache;
+ const LowerZon = @import("Sema/LowerZon.zig");
+ const arith = @import("Sema/arith.zig");
+ const Module = @import("Module.zig");
++const stardust_api = @import("stardust_api.zig");
+
+ pt: Zcu.PerThread,
+ /// Alias to `zcu.gpa`.
+@@ -1395,6 +1396,7 @@ fn analyzeBodyInner(
+                     .round_op           => try sema.zirRoundCast(         block, extended),
+                     .round_op_ty        => try sema.zirRoundOpType(       block, extended),
+                     .compile_log        => try sema.zirCompileLog(        block, extended),
++                    .stardust_claim       => try sema.zirStardustClaim(       block, extended),
+                     .min_multi          => try sema.zirMinMaxMulti(       block, extended, .min),
+                     .max_multi          => try sema.zirMinMaxMulti(       block, extended, .max),
+                     .add_with_overflow  => try sema.zirOverflowArithmetic(block, extended, extended.opcode),
+@@ -5089,6 +5091,82 @@ fn zirCompileLog(
+     return .void_value;
+ }
+
++fn zirStardustClaim(
++    sema: *Sema,
++    block: *Block,
++    extended: Zir.Inst.Extended.InstData,
++) CompileError!Air.Inst.Ref {
++    const extra = sema.code.extraData(Zir.Inst.NodeMultiOp, extended.operand);
++    const src = block.nodeOffset(extra.data.src_node);
++    const args = sema.code.refSlice(extra.end, extended.small);
++    assert(args.len == 7);
++    if (!block.isComptime()) {
++        return sema.fail(block, src, "@stardustClaim requires comptime execution", .{});
++    }
++    const comp = sema.pt.zcu.comp;
++    if (!comp.config.stardust_claim_metadata or comp.stardust_plugin == null) {
++        return .void_value;
++    }
++    const plugin = &comp.stardust_plugin.?;
++    sema.allow_memoize = false;
++
++    var values: [7]InternPool.Index = undefined;
++    var available: [7]bool = undefined;
++    for (args, 0..) |arg_ref, index| {
++        const arg = sema.resolveInst(arg_ref);
++        const value = sema.resolveValue(arg);
++        available[index] = value != null;
++        values[index] = if (value) |resolved|
++            resolved.toIntern()
++        else
++            .none;
++    }
++    if (!available[0]) {
++        return sema.fail(block, src, "@stardustClaim requires an evaluated claim", .{});
++    }
++
++    const roles = [_]stardust_api.ClaimReferenceRole{
++        .owner_family,
++        .default_limits,
++        .seal,
++        .seal_premise,
++        .teardown,
++        .teardown_premise,
++    };
++    var row: stardust_api.ClaimRow = .{
++        .claim_value = @backingInt(values[0]),
++        .test_function = @backingInt(InternPool.Index.none),
++        .test_function_available = 0,
++        .reserved = @splat(0),
++        .references = undefined,
++    };
++    switch (sema.owner.unwrap()) {
++        .func => |function| {
++            const nav = sema.pt.zcu.funcInfo(function).owner_nav;
++            if (sema.pt.zcu.test_functions.contains(nav)) {
++                row.test_function = @backingInt(function);
++                row.test_function_available = 1;
++            }
++        },
++        else => {},
++    }
++    for (&row.references, roles, values[1..], available[1..]) |
++        *reference,
++        role,
++        value,
++        is_available,
++    | {
++        reference.* = .{
++            .value = @backingInt(value),
++            .role = role,
++            .available = @intFromBool(is_available),
++            .reserved = @splat(0),
++        };
++    }
++    plugin.recordClaim(row);
++    return .void_value;
++}
++
+ fn zirPanic(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void {
+     const pt = sema.pt;
+     const zcu = pt.zcu;
+diff --git a/src/Zcu/PerThread.zig b/src/Zcu/PerThread.zig
+index b1292e6d..5c64639b 100644
+--- a/src/Zcu/PerThread.zig
++++ b/src/Zcu/PerThread.zig
+@@ -31,6 +31,7 @@ const trace = tracy.trace;
+ const traceNamed = tracy.traceNamed;
+ const Type = @import("../Type.zig");
+ const Value = @import("../Value.zig");
++const stardust_api = @import("../stardust_api.zig");
+ const Zcu = @import("../Zcu.zig");
+ const Compilation = @import("../Compilation.zig");
+ const codegen = @import("../codegen.zig");
+@@ -490,6 +491,8 @@ pub fn updateFile(
+         // As well as the file path, we also include the compiler version in case of backwards-incompatible ZIR changes.
+         file.path.addToHasher(&h.hasher);
+         h.addBytes(build_options.version);
++        h.addBytes(stardust_api.source_identity);
++        h.addBytes(stardust_api.fork_identity);
+         h.add(builtin.zig_backend);
+         break :d h.final();
+     };
+@@ -2277,6 +2280,20 @@ fn analyzeFuncBody(
+     const dump_air = build_options.enable_debug_extensions and comp.verbose_air;
+     const dump_llvm_ir = build_options.enable_debug_extensions and (comp.verbose_llvm_ir != null or comp.verbose_llvm_bc != null);
+
++    if (comp.stardust_plugin) |*plugin| {
++        Air.Verify.run(pt, func_index, &air);
++        plugin.analyze(pt, func_index, &air) catch {
++            switch (zcu.codegenFail(
++                func.owner_nav,
++                "Stardust plugin analysis failed: {f}",
++                .{plugin.failureCause()},
++            )) {
++                error.AlreadyReported => return .{ .ies_outdated = ies_outdated },
++                error.OutOfMemory => return error.OutOfMemory,
++            }
++        };
++    }
++
+     if (comp.bin_file != null or zcu.llvm_object != null or dump_air or dump_llvm_ir) {
+         zcu.codegen_prog_node.increaseEstimatedTotalItems(1);
+         comp.link_prog_node.increaseEstimatedTotalItems(1);
+diff --git a/src/compiler_api.zig b/src/compiler_api.zig
+new file mode 100644
+index 00000000..b47a5aea
+--- /dev/null
++++ b/src/compiler_api.zig
+@@ -0,0 +1,5 @@
++pub const Air = @import("Air.zig");
++pub const InternPool = @import("InternPool.zig");
++pub const Target = @import("std").Target;
++pub const Zcu = @import("Zcu.zig");
++pub const stardust = @import("stardust_api.zig");
+diff --git a/src/main.zig b/src/main.zig
+index 94011c81..27e6008e 100644
+--- a/src/main.zig
++++ b/src/main.zig
+@@ -539,6 +539,9 @@ const usage_build_generic =
+     \\                            "std" can be configured by omitting src
+     \\                            After a -M argument, per-module settings are reset.
+     \\  --error-limit [num]       Set the maximum amount of distinct error values
++    \\  -fstardust-plugin=[path]    Analyze post-Sema AIR with a dynamic plugin
++    \\  -fstardust-output=[path]    Write plugin output to path
++    \\  -f[no-]stardust-claim-metadata  Record comptime claim metadata for the plugin
+     \\  -fllvm                    Force using LLVM as the codegen backend
+     \\  -fno-llvm                 Prevent using LLVM as the codegen backend
+     \\  -flibllvm                 Force using the LLVM API in the codegen backend
+@@ -1381,6 +1384,14 @@ fn buildOutputType(
+                         mod_opts.code_model = parseCodeModel(rest);
+                     } else if (mem.cutPrefix(u8, arg, "-ofmt=")) |rest| {
+                         create_module.object_format = rest;
++                    } else if (mem.cutPrefix(u8, arg, "-fstardust-plugin=")) |rest| {
++                        create_module.opts.stardust_plugin_path = rest;
++                    } else if (mem.cutPrefix(u8, arg, "-fstardust-output=")) |rest| {
++                        create_module.opts.stardust_output_path = rest;
++                    } else if (mem.eql(u8, arg, "-fstardust-claim-metadata")) {
++                        create_module.opts.stardust_claim_metadata = true;
++                    } else if (mem.eql(u8, arg, "-fno-stardust-claim-metadata")) {
++                        create_module.opts.stardust_claim_metadata = false;
+                     } else if (mem.cutPrefix(u8, arg, "-mcpu=")) |rest| {
+                         target_mcpu = rest;
+                     } else if (mem.cutPrefix(u8, arg, "-O")) |rest| {
+@@ -4234,6 +4245,7 @@ fn createModule(
+             error.SanitizeThreadRequiresPie => fatal("thread sanitization requires position independent executables", .{}),
+             error.SanitizeThreadRequiresLlvmBackend => fatal("thread sanitization requires the LLVM backend", .{}),
+             error.BackendLacksErrorTracing => fatal("the selected backend has not yet implemented error return tracing", .{}),
++            error.StardustOutputRequiresPlugin => fatal("-fstardust-output requires -fstardust-plugin", .{}),
+             error.LlvmLibraryUnavailable => fatal("zig was compiled without LLVM libraries", .{}),
+             error.LldUnavailable => fatal("zig was compiled without LLD libraries", .{}),
+             error.ClangUnavailable => fatal("zig was compiled without Clang libraries", .{}),
+diff --git a/src/print_zir.zig b/src/print_zir.zig
+index ea82384d..195cc155 100644
+--- a/src/print_zir.zig
++++ b/src/print_zir.zig
+@@ -536,7 +536,7 @@ const Writer = struct {
+             .asm_expr => try self.writeAsm(stream, extended, true),
+             .alloc => try self.writeAllocExtended(stream, extended),
+
+-            .compile_log => try self.writeNodeMultiOp(stream, extended),
++            .compile_log, .stardust_claim => try self.writeNodeMultiOp(stream, extended),
+             .typeof_peer => try self.writeTypeofPeer(stream, extended),
+             .min_multi => try self.writeNodeMultiOp(stream, extended),
+             .max_multi => try self.writeNodeMultiOp(stream, extended),
+diff --git a/src/stardust.zig b/src/stardust.zig
+new file mode 100644
+index 00000000..794b958d
+--- /dev/null
++++ b/src/stardust.zig
+@@ -0,0 +1,794 @@
++const std = @import("std");
++const Allocator = std.mem.Allocator;
++const Cache = std.Build.Cache;
++const Io = std.Io;
++const fs = std.fs;
++const Air = @import("Air.zig");
++const InternPool = @import("InternPool.zig");
++const Zcu = @import("Zcu.zig");
++const api = @import("stardust_api.zig");
++
++pub const OpenError = Allocator.Error || std.DynLib.Error ||
++    api.CompatibilityError || error{
++    MissingDescriptor,
++    MissingInit,
++    PluginRejected,
++};
++
++pub const CallbackError = error{PluginFailed};
++
++const ClaimTable = struct {
++    rows: [api.metadata_records_max]api.ClaimRow = undefined,
++    next: std.atomic.Value(u32) = .init(0),
++    overflowed: std.atomic.Value(bool) = .init(false),
++
++    fn append(self: *ClaimTable, row: api.ClaimRow) void {
++        const capacity: u32 = api.metadata_records_max;
++        var index = self.next.load(.monotonic);
++        while (index < capacity) {
++            if (self.next.cmpxchgWeak(
++                index,
++                index + 1,
++                .monotonic,
++                .monotonic,
++            )) |current| {
++                index = current;
++                continue;
++            }
++            self.rows[index] = row;
++            return;
++        }
++        self.overflowed.store(true, .monotonic);
++    }
++
++    fn reset(self: *ClaimTable) void {
++        self.next.store(0, .monotonic);
++        self.overflowed.store(false, .monotonic);
++    }
++
++    fn view(self: *const ClaimTable) api.ClaimsView {
++        const claimed = self.next.load(.acquire);
++        return .{
++            .rows = &self.rows,
++            .len = @min(claimed, @as(u32, api.metadata_records_max)),
++            .overflowed = @intFromBool(self.overflowed.load(.acquire)),
++            .reserved = @splat(0),
++        };
++    }
++};
++
++const HostContext = struct {
++    allocator: Allocator,
++    io: Io,
++    output_path: []const u8,
++    failure: *api.FailureCause,
++    stage: ?Io.File.Atomic = null,
++    stage_reader: ?Io.File = null,
++    stage_limit: u64 = 0,
++    stage_bytes: u64 = 0,
++    stage_started: u8 = 0,
++    stage_failed: bool = false,
++    output: ?Io.File.Atomic = null,
++    output_limit: u64 = 0,
++    output_bytes: u64 = 0,
++    opened: bool = false,
++    flushing: bool = false,
++    write_failed: bool = false,
++    output_started: u8 = 0,
++    output_committed: u8 = 0,
++};
++
++pub const Plugin = struct {
++    lib: std.DynLib = undefined,
++    plugin: api.Plugin = undefined,
++    allocator: Allocator = undefined,
++    host_context: *HostContext = undefined,
++    opened: bool = false,
++    update_started: bool = false,
++    claims: ClaimTable = .{},
++
++    pub const empty: Plugin = .{};
++
++    const snapshot_cache_subdir = ".stardust";
++    const snapshot_cache_basename = "snapshot";
++    const snapshot_family_files_max = 64;
++
++    pub fn beginUpdate(self: *Plugin) CallbackError!void {
++        const host = self.host_context;
++        self.update_started = false;
++        _ = abortOutput(host);
++        _ = discardStage(host);
++        self.plugin.failure = .empty;
++        self.claims.reset();
++        host.stage_limit = 0;
++        host.stage_bytes = 0;
++        host.stage_started = 0;
++        host.stage_failed = false;
++        host.output_limit = 0;
++        host.output_bytes = 0;
++        host.output_started = 0;
++        host.output_committed = 0;
++        host.flushing = false;
++        host.write_failed = false;
++        const status = self.plugin.begin_update(self.plugin.context);
++        const reset_complete = host.stage == null and
++            host.stage_reader == null and
++            host.output == null;
++        if (status != api.status_ok or !reset_complete) {
++            self.plugin.failure.set(
++                .protocol,
++                "update reset status={d} reset_complete={}",
++                .{ status, reset_complete },
++            );
++            return error.PluginFailed;
++        }
++        self.update_started = true;
++    }
++
++    pub fn open(
++        self: *Plugin,
++        path: []const u8,
++        output_path: []const u8,
++        allocator: Allocator,
++        io: Io,
++    ) OpenError!void {
++        self.allocator = allocator;
++        self.plugin.failure = .empty;
++        self.host_context = try allocator.create(HostContext);
++        self.host_context.* = .{
++            .allocator = allocator,
++            .io = io,
++            .output_path = output_path,
++            .failure = &self.plugin.failure,
++        };
++        errdefer allocator.destroy(self.host_context);
++
++        self.lib = try .open(path);
++        errdefer self.lib.close();
++
++        const descriptor = self.lib.lookup(
++            *const api.Descriptor,
++            api.descriptor_symbol,
++        ) orelse return error.MissingDescriptor;
++        try api.ensureCompatible(descriptor);
++
++        const init = self.lib.lookup(api.Init, api.init_symbol) orelse
++            return error.MissingInit;
++        const host: api.Host = .{
++            .descriptor = api.descriptor,
++            .context = self.host_context,
++            .allocator = .{
++                .alloc = hostAlloc,
++                .resize = hostResize,
++                .remap = hostRemap,
++                .free = hostFree,
++            },
++            .stage_begin = stageBegin,
++            .stage_write = stageWrite,
++            .stage_seal = stageSeal,
++            .stage_read = stageRead,
++            .stage_discard = stageDiscard,
++            .begin_output = beginOutput,
++            .write_output = writeOutput,
++            .finish_output = finishOutput,
++        };
++        if (init(&host, &self.plugin) != api.status_ok)
++            return error.PluginRejected;
++        try api.ensureCompatible(&self.plugin.descriptor);
++
++        self.host_context.opened = true;
++        self.opened = true;
++    }
++
++    pub fn deinit(self: *Plugin) void {
++        if (!self.opened) return;
++        _ = abortOutput(self.host_context);
++        _ = discardStage(self.host_context);
++        self.plugin.deinit(self.plugin.context);
++        self.lib.close();
++        self.allocator.destroy(self.host_context);
++        self.opened = false;
++    }
++
++    pub fn analyze(
++        self: *Plugin,
++        pt: Zcu.PerThread,
++        func_index: InternPool.Index,
++        air: *const Air,
++    ) CallbackError!void {
++        const status = self.plugin.analyze(
++            self.plugin.context,
++            @ptrCast(&pt),
++            @backingInt(func_index),
++            @ptrCast(air),
++        );
++        if (status != api.status_ok) {
++            self.plugin.failure.set(
++                .protocol,
++                "analysis callback returned status={d} without a cause",
++                .{status},
++            );
++            return error.PluginFailed;
++        }
++    }
++
++    pub fn failureCause(self: *const Plugin) api.FailureCause {
++        return self.plugin.failure;
++    }
++
++    pub fn recordClaim(self: *Plugin, row: api.ClaimRow) void {
++        self.claims.append(row);
++    }
++
++    pub fn flush(
++        self: *Plugin,
++        zcu: *const Zcu,
++        tid: Zcu.PerThread.Id,
++    ) CallbackError!void {
++        if (self.host_context.output != null) {
++            self.plugin.failure.set(
++                .host,
++                "output transaction remains open before flush",
++                .{},
++            );
++            _ = abortOutput(self.host_context);
++            return error.PluginFailed;
++        }
++        self.host_context.write_failed = false;
++        self.host_context.output_started = 0;
++        self.host_context.output_committed = 0;
++        self.host_context.flushing = true;
++        defer self.host_context.flushing = false;
++        const claims = self.claims.view();
++        const status = self.plugin.flush(
++            self.plugin.context,
++            @ptrCast(zcu),
++            @backingInt(tid),
++            &claims,
++        );
++        const publication_complete = self.host_context.output == null and
++            self.host_context.stage == null and
++            self.host_context.stage_reader == null and
++            !self.host_context.stage_failed and
++            self.host_context.output_started >= 1 and
++            self.host_context.output_started <= 2 and
++            self.host_context.output_committed == 1 and
++            self.host_context.output_bytes > 0;
++        if (status != api.status_ok or self.host_context.write_failed or
++            !publication_complete)
++        {
++            self.plugin.failure.set(
++                .protocol,
++                "flush status={d} write_failed={} publication_complete={}",
++                .{ status, self.host_context.write_failed, publication_complete },
++            );
++            _ = abortOutput(self.host_context);
++            _ = discardStage(self.host_context);
++            return error.PluginFailed;
++        }
++        self.host_context.stage_started = 0;
++        self.host_context.stage_failed = false;
++        self.update_started = false;
++    }
++
++    pub fn persistSnapshot(
++        self: *Plugin,
++        local_cache: Cache.Directory,
++        digest: Cache.BinDigest,
++    ) !void {
++        const io = self.host_context.io;
++        const output_path = self.host_context.output_path;
++        const output_dirname = fs.path.dirname(output_path) orelse ".";
++        const output_basename = fs.path.basename(output_path);
++        var output_dir = try Io.Dir.cwd().openDir(io, output_dirname, .{
++            .iterate = true,
++            .follow_symlinks = false,
++        });
++        defer output_dir.close(io);
++
++        var cache_path_storage: [Io.Dir.max_path_bytes]u8 = undefined;
++        const cache_path = try snapshotCachePath(&cache_path_storage, digest);
++        var cache_dir = try local_cache.handle.createDirPathOpen(io, cache_path, .{
++            .open_options = .{
++                .iterate = true,
++                .follow_symlinks = false,
++            },
++        });
++        defer cache_dir.close(io);
++
++        var found_main = false;
++        var file_count: usize = 0;
++        var iterator = output_dir.iterate();
++        while (try iterator.next(io)) |entry| {
++            const suffix = snapshotFamilySuffix(output_basename, entry.name) orelse
++                continue;
++            if (file_count >= snapshot_family_files_max)
++                return error.SnapshotFamilyCapacityExceeded;
++            const stat = try output_dir.statFile(io, entry.name, .{
++                .follow_symlinks = false,
++            });
++            if (stat.kind != .file or stat.size == 0)
++                return error.InvalidSnapshotFamilyMember;
++            var cache_name_storage: [Io.Dir.max_name_bytes]u8 = undefined;
++            const cache_name = try std.fmt.bufPrint(
++                &cache_name_storage,
++                "{s}{s}",
++                .{ snapshot_cache_basename, suffix },
++            );
++            try output_dir.copyFile(entry.name, cache_dir, cache_name, io, .{});
++            found_main = found_main or suffix.len == 0;
++            file_count += 1;
++        }
++        if (!found_main) return error.MissingSnapshot;
++    }
++
++    pub fn restoreSnapshot(
++        self: *Plugin,
++        local_cache: Cache.Directory,
++        digest: Cache.BinDigest,
++    ) !void {
++        const io = self.host_context.io;
++        var cache_path_storage: [Io.Dir.max_path_bytes]u8 = undefined;
++        const cache_path = try snapshotCachePath(&cache_path_storage, digest);
++        var cache_dir = try local_cache.handle.openDir(io, cache_path, .{
++            .iterate = true,
++            .follow_symlinks = false,
++        });
++        defer cache_dir.close(io);
++
++        const output_path = self.host_context.output_path;
++        const output_dirname = fs.path.dirname(output_path) orelse ".";
++        const output_basename = fs.path.basename(output_path);
++        var output_dir = try Io.Dir.cwd().openDir(io, output_dirname, .{
++            .follow_symlinks = false,
++        });
++        defer output_dir.close(io);
++
++        var found_main = false;
++        var file_count: usize = 0;
++        var iterator = cache_dir.iterate();
++        while (try iterator.next(io)) |entry| {
++            const suffix = snapshotFamilySuffix(snapshot_cache_basename, entry.name) orelse
++                continue;
++            if (file_count >= snapshot_family_files_max)
++                return error.SnapshotFamilyCapacityExceeded;
++            const stat = try cache_dir.statFile(io, entry.name, .{
++                .follow_symlinks = false,
++            });
++            if (stat.kind != .file or stat.size == 0)
++                return error.InvalidSnapshotFamilyMember;
++            var output_name_storage: [Io.Dir.max_name_bytes]u8 = undefined;
++            const output_name = try std.fmt.bufPrint(
++                &output_name_storage,
++                "{s}{s}",
++                .{ output_basename, suffix },
++            );
++            try cache_dir.copyFile(entry.name, output_dir, output_name, io, .{});
++            found_main = found_main or suffix.len == 0;
++            file_count += 1;
++        }
++        if (!found_main) return error.MissingSnapshot;
++    }
++
++    fn snapshotCachePath(
++        storage: *[Io.Dir.max_path_bytes]u8,
++        digest: Cache.BinDigest,
++    ) std.fmt.BufPrintError![]const u8 {
++        const hex_digest = Cache.binToHex(digest);
++        return std.fmt.bufPrint(
++            storage,
++            "o{s}{s}{s}{s}",
++            .{
++                fs.path.sep_str,
++                hex_digest[0..],
++                fs.path.sep_str,
++                snapshot_cache_subdir,
++            },
++        );
++    }
++
++    fn snapshotFamilySuffix(
++        basename: []const u8,
++        candidate: []const u8,
++    ) ?[]const u8 {
++        if (std.mem.eql(u8, candidate, basename)) return candidate[candidate.len..];
++        if (!std.mem.startsWith(u8, candidate, basename)) return null;
++        if (candidate.len == basename.len or candidate[basename.len] != '.') return null;
++        return candidate[basename.len..];
++    }
++
++    fn fromContext(context: ?*anyopaque) *HostContext {
++        return @ptrCast(@alignCast(context.?));
++    }
++
++    fn hostFailure(
++        host: *HostContext,
++        comptime format_text: []const u8,
++        arguments: anytype,
++    ) u32 {
++        host.failure.set(.host, format_text, arguments);
++        return api.status_failed;
++    }
++
++    fn hostAlloc(
++        context: ?*anyopaque,
++        len: usize,
++        alignment: u8,
++        return_address: usize,
++    ) callconv(.c) ?[*]u8 {
++        const host = fromContext(context);
++        return host.allocator.rawAlloc(
++            len,
++            @fromBackingInt(@intCast(alignment)),
++            return_address,
++        );
++    }
++
++    fn hostResize(
++        context: ?*anyopaque,
++        pointer: ?[*]u8,
++        len: usize,
++        alignment: u8,
++        new_len: usize,
++        return_address: usize,
++    ) callconv(.c) bool {
++        const host = fromContext(context);
++        return host.allocator.rawResize(
++            pointer.?[0..len],
++            @fromBackingInt(@intCast(alignment)),
++            new_len,
++            return_address,
++        );
++    }
++
++    fn hostRemap(
++        context: ?*anyopaque,
++        pointer: ?[*]u8,
++        len: usize,
++        alignment: u8,
++        new_len: usize,
++        return_address: usize,
++    ) callconv(.c) ?[*]u8 {
++        const host = fromContext(context);
++        return host.allocator.rawRemap(
++            pointer.?[0..len],
++            @fromBackingInt(@intCast(alignment)),
++            new_len,
++            return_address,
++        );
++    }
++
++    fn hostFree(
++        context: ?*anyopaque,
++        pointer: ?[*]u8,
++        len: usize,
++        alignment: u8,
++        return_address: usize,
++    ) callconv(.c) void {
++        const host = fromContext(context);
++        host.allocator.rawFree(
++            pointer.?[0..len],
++            @fromBackingInt(@intCast(alignment)),
++            return_address,
++        );
++    }
++
++    fn stageBegin(
++        context: ?*anyopaque,
++        max_bytes: u64,
++    ) callconv(.c) u32 {
++        const host = fromContext(context);
++        if (!host.opened or host.flushing or host.stage != null or
++            host.stage_reader != null or host.stage_started != 0 or
++            max_bytes == 0 or max_bytes > api.stage_hard_limit)
++        {
++            host.stage_failed = true;
++            return hostFailure(
++                host,
++                "stage-begin rejected max_bytes={d} hard_limit={d}",
++                .{ max_bytes, api.stage_hard_limit },
++            );
++        }
++        host.stage = Io.Dir.cwd().createFileAtomic(
++            host.io,
++            host.output_path,
++            .{ .replace = true },
++        ) catch |err| {
++            host.stage_failed = true;
++            return hostFailure(host, "stage-begin error={t}", .{err});
++        };
++        host.stage_limit = max_bytes;
++        host.stage_bytes = 0;
++        host.stage_started = 1;
++        return api.status_ok;
++    }
++
++    fn stageWrite(
++        context: ?*anyopaque,
++        pointer: [*]const u8,
++        len: usize,
++        offset: *u64,
++    ) callconv(.c) u32 {
++        const host = fromContext(context);
++        if (host.flushing or host.stage == null or host.stage_reader != null) {
++            host.stage_failed = true;
++            return hostFailure(
++                host,
++                "stage-write rejected bytes={d} offset={d} limit={d}",
++                .{ len, host.stage_bytes, host.stage_limit },
++            );
++        }
++        const next = std.math.add(u64, host.stage_bytes, len) catch {
++            host.stage_failed = true;
++            return hostFailure(
++                host,
++                "stage-write offset overflow at offset={d} bytes={d}",
++                .{ host.stage_bytes, len },
++            );
++        };
++        if (next > host.stage_limit) {
++            host.stage_failed = true;
++            return hostFailure(
++                host,
++                "stage-write requires bytes={d} with limit={d}",
++                .{ next, host.stage_limit },
++            );
++        }
++        const stage = &host.stage.?;
++        stage.file.writeStreamingAll(host.io, pointer[0..len]) catch |err| {
++            host.stage_failed = true;
++            return hostFailure(host, "stage-write error={t}", .{err});
++        };
++        offset.* = host.stage_bytes;
++        host.stage_bytes = next;
++        return api.status_ok;
++    }
++
++    fn stageSeal(context: ?*anyopaque) callconv(.c) u32 {
++        const host = fromContext(context);
++        if (!host.flushing or host.stage == null or
++            host.stage_reader != null)
++        {
++            host.stage_failed = true;
++            return hostFailure(host, "stage-seal rejected its phase", .{});
++        }
++        const stage = &host.stage.?;
++        if (stage.file_open) {
++            stage.file.close(host.io);
++            stage.file_open = false;
++        }
++        if (!stage.file_exists) {
++            host.stage_failed = true;
++            return hostFailure(host, "stage-seal lost its temporary file", .{});
++        }
++        const temporary = std.fmt.hex(stage.file_basename_hex);
++        host.stage_reader = stage.dir.openFile(
++            host.io,
++            &temporary,
++            .{ .allow_directory = false, .follow_symlinks = false },
++        ) catch |err| {
++            host.stage_failed = true;
++            return hostFailure(host, "stage-seal error={t}", .{err});
++        };
++        return api.status_ok;
++    }
++
++    fn stageRead(
++        context: ?*anyopaque,
++        offset: u64,
++        pointer: [*]u8,
++        len: usize,
++    ) callconv(.c) u32 {
++        const host = fromContext(context);
++        if (!host.flushing or host.stage_reader == null) {
++            host.stage_failed = true;
++            return hostFailure(host, "stage-read rejected its phase", .{});
++        }
++        const reader = host.stage_reader.?;
++        const end = std.math.add(u64, offset, len) catch {
++            host.stage_failed = true;
++            return hostFailure(
++                host,
++                "stage-read offset overflow at offset={d} bytes={d}",
++                .{ offset, len },
++            );
++        };
++        if (end > host.stage_bytes) {
++            host.stage_failed = true;
++            return hostFailure(
++                host,
++                "stage-read requires end={d} with bytes={d}",
++                .{ end, host.stage_bytes },
++            );
++        }
++        const read = reader.readPositionalAll(
++            host.io,
++            pointer[0..len],
++            offset,
++        ) catch |err| {
++            host.stage_failed = true;
++            return hostFailure(host, "stage-read error={t}", .{err});
++        };
++        if (read != len) {
++            host.stage_failed = true;
++            return hostFailure(
++                host,
++                "stage-read returned bytes={d} with requested={d}",
++                .{ read, len },
++            );
++        }
++        return api.status_ok;
++    }
++
++    fn stageDiscard(context: ?*anyopaque) callconv(.c) u32 {
++        const host = fromContext(context);
++        if (!host.flushing) {
++            host.stage_failed = true;
++            return hostFailure(host, "stage-discard rejected its phase", .{});
++        }
++        if (discardStage(host)) return api.status_ok;
++        host.stage_failed = true;
++        return hostFailure(host, "stage-discard could not remove its file", .{});
++    }
++
++    fn beginOutput(
++        context: ?*anyopaque,
++        max_bytes: u64,
++    ) callconv(.c) u32 {
++        const host = fromContext(context);
++        if (!host.opened or !host.flushing or host.output != null or
++            host.output_started >= 2 or host.output_committed != 0 or
++            max_bytes == 0 or max_bytes > api.output_hard_limit)
++        {
++            host.write_failed = true;
++            return hostFailure(
++                host,
++                "output-begin rejected max_bytes={d} hard_limit={d}",
++                .{ max_bytes, api.output_hard_limit },
++            );
++        }
++        host.output = Io.Dir.cwd().createFileAtomic(
++            host.io,
++            host.output_path,
++            .{ .replace = true },
++        ) catch |err| {
++            host.write_failed = true;
++            return hostFailure(host, "output-begin error={t}", .{err});
++        };
++        host.output_started += 1;
++        host.output_limit = max_bytes;
++        host.output_bytes = 0;
++        return api.status_ok;
++    }
++
++    fn writeOutput(
++        context: ?*anyopaque,
++        pointer: [*]const u8,
++        len: usize,
++    ) callconv(.c) u32 {
++        const host = fromContext(context);
++        if (!host.flushing or host.output == null) {
++            host.write_failed = true;
++            return hostFailure(host, "output-write rejected its phase", .{});
++        }
++        const next = std.math.add(u64, host.output_bytes, len) catch {
++            host.write_failed = true;
++            return hostFailure(
++                host,
++                "output-write offset overflow at offset={d} bytes={d}",
++                .{ host.output_bytes, len },
++            );
++        };
++        if (next > host.output_limit) {
++            host.write_failed = true;
++            return hostFailure(
++                host,
++                "output-write requires bytes={d} with limit={d}",
++                .{ next, host.output_limit },
++            );
++        }
++        const output = &host.output.?;
++        output.file.writeStreamingAll(host.io, pointer[0..len]) catch |err| {
++            host.write_failed = true;
++            return hostFailure(host, "output-write error={t}", .{err});
++        };
++        host.output_bytes = next;
++        return api.status_ok;
++    }
++
++    fn finishOutput(
++        context: ?*anyopaque,
++        commit: u8,
++    ) callconv(.c) u32 {
++        const host = fromContext(context);
++        if (!host.flushing or host.output == null or commit > 1) {
++            host.write_failed = true;
++            return hostFailure(
++                host,
++                "output-finish rejected commit={d}",
++                .{commit},
++            );
++        }
++        const output = &host.output.?;
++        if (commit == 0) {
++            if (abortOutput(host)) return api.status_ok;
++            return hostFailure(host, "output-abort could not remove its file", .{});
++        }
++        output.file.sync(host.io) catch |err| {
++            host.write_failed = true;
++            return hostFailure(host, "output-sync error={t}", .{err});
++        };
++        output.replace(host.io) catch |err| {
++            host.write_failed = true;
++            return hostFailure(host, "output-commit error={t}", .{err});
++        };
++        output.deinit(host.io);
++        host.output = null;
++        host.output_limit = 0;
++        host.output_committed = 1;
++        return api.status_ok;
++    }
++
++    fn abortOutput(host: *HostContext) bool {
++        if (host.output == null) return true;
++        const output = &host.output.?;
++        if (output.file_open) {
++            output.file.close(host.io);
++            output.file_open = false;
++        }
++        if (output.file_exists) {
++            const temporary = std.fmt.hex(output.file_basename_hex);
++            var deleted = true;
++            output.dir.deleteFile(host.io, &temporary) catch {
++                host.write_failed = true;
++                deleted = false;
++            };
++            output.file_exists = false;
++            if (!deleted) {
++                if (output.close_dir_on_deinit) {
++                    output.dir.close(host.io);
++                    output.close_dir_on_deinit = false;
++                }
++                output.* = undefined;
++                host.output = null;
++                return false;
++            }
++        }
++        if (output.close_dir_on_deinit) {
++            output.dir.close(host.io);
++            output.close_dir_on_deinit = false;
++        }
++        output.* = undefined;
++        host.output = null;
++        host.output_limit = 0;
++        return true;
++    }
++
++    fn discardStage(host: *HostContext) bool {
++        if (host.stage_reader) |reader| reader.close(host.io);
++        host.stage_reader = null;
++        host.stage_limit = 0;
++        host.stage_bytes = 0;
++        if (host.stage == null) return true;
++        const stage = &host.stage.?;
++        if (stage.file_open) {
++            stage.file.close(host.io);
++            stage.file_open = false;
++        }
++        var deleted = true;
++        if (stage.file_exists) {
++            const temporary = std.fmt.hex(stage.file_basename_hex);
++            stage.dir.deleteFile(host.io, &temporary) catch {
++                deleted = false;
++            };
++            stage.file_exists = false;
++        }
++        if (stage.close_dir_on_deinit) {
++            stage.dir.close(host.io);
++            stage.close_dir_on_deinit = false;
++        }
++        stage.* = undefined;
++        host.stage = null;
++        return deleted;
++    }
++};
+diff --git a/src/stardust_api.zig b/src/stardust_api.zig
+new file mode 100644
+index 00000000..65298a56
+--- /dev/null
++++ b/src/stardust_api.zig
+@@ -0,0 +1,400 @@
++const std = @import("std");
++const builtin = @import("builtin");
++const build_options = @import("build_options");
++const Air = @import("Air.zig");
++const InternPool = @import("InternPool.zig");
++const Zcu = @import("Zcu.zig");
++
++pub const api_epoch: u32 = 8;
++pub const source_identity = "tiny.zig.source.identity";
++pub const fork_identity = "tiny.zig.fork.identity";
++pub const descriptor_symbol: [:0]const u8 =
++    "tiny_stardust_plugin_descriptor_v8";
++pub const init_symbol: [:0]const u8 = "tiny_stardust_plugin_init_v8";
++
++pub const status_ok: u32 = 0;
++pub const status_incompatible: u32 = 1;
++pub const status_failed: u32 = 2;
++pub const stage_hard_limit: u64 = 2_147_483_648;
++pub const output_hard_limit: u64 = 1_073_741_824;
++pub const claim_declarations_max: usize = 256;
++pub const claim_reference_count: usize = 6;
++pub const test_witnesses_max: usize = claim_declarations_max * 24;
++pub const metadata_records_max: usize = claim_declarations_max + test_witnesses_max;
++pub const failure_text_bytes_max: usize = 256;
++
++pub const FailureTag = enum(u32) {
++    none,
++    initialization,
++    analysis,
++    unit,
++    phase,
++    capacity,
++    shape,
++    publish,
++    host,
++    protocol,
++};
++
++pub const FailureCause = extern struct {
++    tag: FailureTag,
++    text_len: u32,
++    text: [failure_text_bytes_max]u8,
++
++    pub const empty: FailureCause = .{
++        .tag = .none,
++        .text_len = 0,
++        .text = @splat(0),
++    };
++
++    pub fn set(
++        self: *FailureCause,
++        tag: FailureTag,
++        comptime format_text: []const u8,
++        arguments: anytype,
++    ) void {
++        if (self.tag != .none) return;
++        const written = std.fmt.bufPrint(
++            &self.text,
++            format_text,
++            arguments,
++        ) catch fallback: {
++            const value = "failure details exceed the API text capacity";
++            @memcpy(self.text[0..value.len], value);
++            break :fallback self.text[0..value.len];
++        };
++        self.text_len = @intCast(written.len);
++        self.tag = tag;
++    }
++
++    pub fn details(self: *const FailureCause) []const u8 {
++        const len = @min(self.text_len, failure_text_bytes_max);
++        return self.text[0..len];
++    }
++
++    pub fn format(
++        self: FailureCause,
++        writer: *std.Io.Writer,
++    ) std.Io.Writer.Error!void {
++        const tag = if (self.tag == .none) "unreported" else @tagName(self.tag);
++        const detail = if (self.text_len == 0) "plugin supplied no details" else self.details();
++        try writer.print("{s}: {s}. ", .{ tag, detail });
++        try writer.writeAll(
++            "Correct the reported condition, or report this cause with " ++
++                "the failing compile unit. Rerun the same Stardust build command.",
++        );
++    }
++};
++
++pub const ClaimReferenceRole = enum(u8) {
++    owner_family,
++    default_limits,
++    seal,
++    seal_premise,
++    teardown,
++    teardown_premise,
++};
++
++comptime {
++    if (@typeInfo(ClaimReferenceRole).@"enum".field_names.len != claim_reference_count) {
++        @compileError("Claim reference count differs from its role enum");
++    }
++}
++
++pub const ClaimReference = extern struct {
++    value: u32,
++    role: ClaimReferenceRole,
++    available: u8,
++    reserved: [2]u8,
++};
++
++pub const ClaimRow = extern struct {
++    claim_value: u32,
++    test_function: u32,
++    test_function_available: u8,
++    reserved: [3]u8,
++    references: [claim_reference_count]ClaimReference,
++};
++
++pub const ClaimsView = extern struct {
++    rows: [*]const ClaimRow,
++    len: u32,
++    overflowed: u8,
++    reserved: [3]u8,
++};
++
++const api_schema =
++    \\tiny.stardust.api.8
++    \\Descriptor{size:u32,api_epoch:u32,api_digest:[32]u8,fork_digest:[32]u8,source_commit:[40]u8,build_options_digest:[32]u8,private_layout_digest:[32]u8,host_size:u32,plugin_size:u32,host_triple_len:u8,host_triple:[96]u8,optimize_mode:u8,pointer_bits:u8,endian:u8}
++    \\AllocatorVTable{alloc,resize,remap,free}
++    \\FailureTag{none,initialization,analysis,unit,phase,capacity,shape,publish,host,protocol}
++    \\FailureCause{tag:u32,text_len:u32,text:[256]u8}
++    \\ClaimReferenceRole{owner_family,default_limits,seal,seal_premise,teardown,teardown_premise}
++    \\ClaimReference{value:u32,role:u8,available:u8,reserved:[2]u8}
++    \\ClaimRow{claim_value:u32,test_function:u32,test_function_available:u8,reserved:[3]u8,references:[6]ClaimReference}
++    \\ClaimsView{rows:ClaimRow*,len:u32,overflowed:u8,reserved:[3]u8}
++    \\claim_declarations_max=256
++    \\test_witnesses_max=6144
++    \\metadata_records_max=6400
++    \\Host{descriptor,context,allocator,stage_begin,stage_write,stage_seal,stage_read,stage_discard,begin_output,write_output,finish_output}
++    \\stage_hard_limit=2147483648
++    \\output_hard_limit=1073741824
++    \\stage_begin(context,max_bytes)u32
++    \\stage_write(context,bytes,out_offset)u32
++    \\stage_seal(context)u32
++    \\stage_read(context,offset,bytes)u32
++    \\stage_discard(context)u32
++    \\begin_output(context,max_bytes)u32
++    \\write_output(context,bytes)u32
++    \\finish_output(context,commit:0|1)u32
++    \\Plugin{descriptor,context,failure,begin_update,analyze,flush,deinit}
++    \\begin_update(context)u32
++    \\analyze(context,PerThread*,InternPool.Index,Air*)u32
++    \\flush(context,Zcu*,PerThread.Id,ClaimsView*)u32
++;
++
++const build_options_schema = std.fmt.comptimePrint(
++    "version={s};mem_leak_frames={d};have_llvm={};llvm_has_m68k={};llvm_has_csky={};llvm_has_arc={};llvm_has_xtensa={};debug_gpa={};dev={s};io_mode={s};value_interpret_mode={s};enable_debug_extensions={};enable_logging={};enable_tracy={};enable_tracy_callstack={};enable_tracy_allocation={};tracy_callstack_depth={d};value_tracing={}",
++    .{
++        build_options.version,
++        build_options.mem_leak_frames,
++        build_options.have_llvm,
++        build_options.llvm_has_m68k,
++        build_options.llvm_has_csky,
++        build_options.llvm_has_arc,
++        build_options.llvm_has_xtensa,
++        build_options.debug_gpa,
++        @tagName(build_options.dev),
++        @tagName(build_options.io_mode),
++        @tagName(build_options.value_interpret_mode),
++        build_options.enable_debug_extensions,
++        build_options.enable_logging,
++        build_options.enable_tracy,
++        build_options.enable_tracy_callstack,
++        build_options.enable_tracy_allocation,
++        build_options.tracy_callstack_depth,
++        build_options.value_tracing,
++    },
++);
++
++const private_layout_schema = std.fmt.comptimePrint(
++    "Air:size={d},align={d},instructions={d},extra={d};Air.Inst:size={d},align={d},tag={d},data={d};InternPool.Index:size={d},align={d}",
++    .{
++        @sizeOf(Air),
++        @alignOf(Air),
++        @offsetOf(Air, "instructions"),
++        @offsetOf(Air, "extra"),
++        @sizeOf(Air.Inst),
++        @alignOf(Air.Inst),
++        @offsetOf(Air.Inst, "tag"),
++        @offsetOf(Air.Inst, "data"),
++        @sizeOf(InternPool.Index),
++        @alignOf(InternPool.Index),
++    },
++) ++ std.fmt.comptimePrint(
++    ";Zcu:size={d},align={d},intern_pool={d};Zcu.PerThread:size={d},align={d},zcu={d},tid={d};Zcu.PerThread.Id:size={d},align={d};ClaimReference:size={d},align={d},value={d},role={d},available={d};ClaimRow:size={d},align={d},claim_value={d},test_function={d},test_function_available={d},references={d};ClaimsView:size={d},align={d},rows={d},len={d},overflowed={d};FailureCause:size={d},align={d},tag={d},text_len={d},text={d}",
++    .{
++        @sizeOf(Zcu),
++        @alignOf(Zcu),
++        @offsetOf(Zcu, "intern_pool"),
++        @sizeOf(Zcu.PerThread),
++        @alignOf(Zcu.PerThread),
++        @offsetOf(Zcu.PerThread, "zcu"),
++        @offsetOf(Zcu.PerThread, "tid"),
++        @sizeOf(Zcu.PerThread.Id),
++        @alignOf(Zcu.PerThread.Id),
++        @sizeOf(ClaimReference),
++        @alignOf(ClaimReference),
++        @offsetOf(ClaimReference, "value"),
++        @offsetOf(ClaimReference, "role"),
++        @offsetOf(ClaimReference, "available"),
++        @sizeOf(ClaimRow),
++        @alignOf(ClaimRow),
++        @offsetOf(ClaimRow, "claim_value"),
++        @offsetOf(ClaimRow, "test_function"),
++        @offsetOf(ClaimRow, "test_function_available"),
++        @offsetOf(ClaimRow, "references"),
++        @sizeOf(ClaimsView),
++        @alignOf(ClaimsView),
++        @offsetOf(ClaimsView, "rows"),
++        @offsetOf(ClaimsView, "len"),
++        @offsetOf(ClaimsView, "overflowed"),
++        @sizeOf(FailureCause),
++        @alignOf(FailureCause),
++        @offsetOf(FailureCause, "tag"),
++        @offsetOf(FailureCause, "text_len"),
++        @offsetOf(FailureCause, "text"),
++    },
++);
++
++pub const api_digest = digest(api_schema);
++pub const fork_digest = digest(fork_identity);
++pub const build_options_digest = digest(build_options_schema);
++pub const private_layout_digest = digest(private_layout_schema);
++pub const host_triple_text =
++    @tagName(builtin.target.cpu.arch) ++ "-" ++
++    @tagName(builtin.target.os.tag) ++ "-" ++
++    @tagName(builtin.target.abi);
++
++pub const Descriptor = extern struct {
++    size: u32,
++    api_epoch: u32,
++    api_digest: [32]u8,
++    fork_digest: [32]u8,
++    source_commit: [40]u8,
++    build_options_digest: [32]u8,
++    private_layout_digest: [32]u8,
++    host_size: u32,
++    plugin_size: u32,
++    host_triple_len: u8,
++    host_triple: [96]u8,
++    optimize_mode: u8,
++    pointer_bits: u8,
++    endian: u8,
++};
++
++pub const descriptor: Descriptor = makeDescriptor();
++
++pub const CompatibilityError = error{
++    DescriptorSizeMismatch,
++    ApiEpochMismatch,
++    ApiDigestMismatch,
++    ForkDigestMismatch,
++    SourceCommitMismatch,
++    BuildOptionsMismatch,
++    PrivateLayoutMismatch,
++    HostSizeMismatch,
++    PluginSizeMismatch,
++    HostTripleMismatch,
++    OptimizeModeMismatch,
++    PointerWidthMismatch,
++    EndianMismatch,
++};
++
++pub fn ensureCompatible(actual: *const Descriptor) CompatibilityError!void {
++    if (actual.size != @sizeOf(Descriptor))
++        return error.DescriptorSizeMismatch;
++    if (actual.api_epoch != api_epoch)
++        return error.ApiEpochMismatch;
++    if (!bytesMatch(&actual.api_digest, &api_digest))
++        return error.ApiDigestMismatch;
++    if (!bytesMatch(&actual.fork_digest, &fork_digest))
++        return error.ForkDigestMismatch;
++    if (!bytesMatch(&actual.source_commit, source_identity))
++        return error.SourceCommitMismatch;
++    if (!bytesMatch(&actual.build_options_digest, &build_options_digest))
++        return error.BuildOptionsMismatch;
++    if (!bytesMatch(&actual.private_layout_digest, &private_layout_digest))
++        return error.PrivateLayoutMismatch;
++    if (actual.host_size != @sizeOf(Host))
++        return error.HostSizeMismatch;
++    if (actual.plugin_size != @sizeOf(Plugin))
++        return error.PluginSizeMismatch;
++    if (actual.host_triple_len != host_triple_text.len or
++        !bytesMatch(
++            actual.host_triple[0..host_triple_text.len],
++            host_triple_text,
++        ))
++    {
++        return error.HostTripleMismatch;
++    }
++    if (actual.optimize_mode != @backingInt(builtin.mode))
++        return error.OptimizeModeMismatch;
++    if (actual.pointer_bits != @bitSizeOf(usize))
++        return error.PointerWidthMismatch;
++    if (actual.endian != @backingInt(builtin.target.cpu.arch.endian()))
++        return error.EndianMismatch;
++}
++
++pub fn descriptorMatches(actual: *const Descriptor) bool {
++    ensureCompatible(actual) catch return false;
++    return true;
++}
++
++pub const AllocatorVTable = extern struct {
++    alloc: *const fn (?*anyopaque, usize, u8, usize) callconv(.c) ?[*]u8,
++    resize: *const fn (?*anyopaque, ?[*]u8, usize, u8, usize, usize) callconv(.c) bool,
++    remap: *const fn (?*anyopaque, ?[*]u8, usize, u8, usize, usize) callconv(.c) ?[*]u8,
++    free: *const fn (?*anyopaque, ?[*]u8, usize, u8, usize) callconv(.c) void,
++};
++
++pub const Host = extern struct {
++    descriptor: Descriptor,
++    context: ?*anyopaque,
++    allocator: AllocatorVTable,
++    stage_begin: *const fn (?*anyopaque, u64) callconv(.c) u32,
++    stage_write: *const fn (
++        ?*anyopaque,
++        [*]const u8,
++        usize,
++        *u64,
++    ) callconv(.c) u32,
++    stage_seal: *const fn (?*anyopaque) callconv(.c) u32,
++    stage_read: *const fn (
++        ?*anyopaque,
++        u64,
++        [*]u8,
++        usize,
++    ) callconv(.c) u32,
++    stage_discard: *const fn (?*anyopaque) callconv(.c) u32,
++    begin_output: *const fn (?*anyopaque, u64) callconv(.c) u32,
++    write_output: *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) u32,
++    finish_output: *const fn (?*anyopaque, u8) callconv(.c) u32,
++};
++
++pub const Plugin = extern struct {
++    descriptor: Descriptor,
++    context: ?*anyopaque,
++    failure: FailureCause,
++    begin_update: *const fn (?*anyopaque) callconv(.c) u32,
++    analyze: *const fn (
++        ?*anyopaque,
++        *const anyopaque,
++        u32,
++        *const anyopaque,
++    ) callconv(.c) u32,
++    flush: *const fn (
++        ?*anyopaque,
++        *const anyopaque,
++        u32,
++        *const ClaimsView,
++    ) callconv(.c) u32,
++    deinit: *const fn (?*anyopaque) callconv(.c) void,
++};
++
++pub const Init = *const fn (*const Host, *Plugin) callconv(.c) u32;
++
++fn digest(comptime material: []const u8) [32]u8 {
++    @setEvalBranchQuota(100_000);
++    var result: [32]u8 = undefined;
++    std.crypto.hash.sha2.Sha256.hash(material, &result, .{});
++    return result;
++}
++
++fn bytesMatch(actual: []const u8, comptime expected: []const u8) bool {
++    inline for (expected, 0..) |byte, index| {
++        if (actual[index] != byte) return false;
++    }
++    return true;
++}
++
++fn makeDescriptor() Descriptor {
++    var result: Descriptor = .{
++        .size = @sizeOf(Descriptor),
++        .api_epoch = api_epoch,
++        .api_digest = api_digest,
++        .fork_digest = fork_digest,
++        .source_commit = source_identity[0..40].*,
++        .build_options_digest = build_options_digest,
++        .private_layout_digest = private_layout_digest,
++        .host_size = @sizeOf(Host),
++        .plugin_size = @sizeOf(Plugin),
++        .host_triple_len = host_triple_text.len,
++        .host_triple = @splat(0),
++        .optimize_mode = @backingInt(builtin.mode),
++        .pointer_bits = @bitSizeOf(usize),
++        .endian = @backingInt(builtin.target.cpu.arch.endian()),
++    };
++    @memcpy(result.host_triple[0..host_triple_text.len], host_triple_text);
++    return result;
++}
+diff --git a/src/Air.zig b/src/Air.zig
+--- a/src/Air.zig
++++ b/src/Air.zig
+@@ -1379,2 +1379,9 @@ pub const Call = struct {
+     args_len: u32,
++    flags: Flags = .{},
++
++    pub const Flags = packed struct(u32) {
++        /// True only for calls emitted while lowering safety-checked illegal behavior.
++        safety_check: bool = false,
++        _: u31 = 0,
++    };
+ };
+@@ -1881,3 +1887,3 @@ pub fn extraData(air: Air, comptime T: type, index: usize) struct { data: T, end: usize } {
+-            i32, CondBr.BranchHints, Asm.Flags => @bitCast(air.extra.items[i]),
++            i32, Call.Flags, CondBr.BranchHints, Asm.Flags => @bitCast(air.extra.items[i]),
+             else => @compileError("bad field type: " ++ @typeName(field_type)),
+         };
+@@ -2283,3 +2289,4 @@ pub const UnwrappedCall = struct {
+     callee: Inst.Ref,
+     args: []const Air.Inst.Ref,
++    safety_check: bool,
+ };
+@@ -2296,5 +2303,6 @@ pub fn unwrapCall(air: *const Air, inst_index: Inst.Index) UnwrappedCall {
+     return .{
+         .callee = data.pl_op.operand,
+         .args = @ptrCast(air.extra.items[extra.end..][0..extra.data.args_len]),
++        .safety_check = extra.data.flags.safety_check,
+     };
+ }
+diff --git a/src/Sema.zig b/src/Sema.zig
+--- a/src/Sema.zig
++++ b/src/Sema.zig
+@@ -7144,5 +7144,6 @@ fn analyzeCall(
+                 .operand = runtime_func,
+                 .payload = sema.addExtraAssumeCapacity(Air.Call{
+                     .args_len = @intCast(runtime_args.len),
++                    .flags = .{ .safety_check = operation == .@"safety check" },
+                 }),
+             } },
+@@ -33918,3 +33919,3 @@ fn payloadToExtraItems(data: anytype) [@typeInfo(@TypeOf(data)).@"struct".field_names.len]u32 {
+-            i32, Air.CondBr.BranchHints, Air.Asm.Flags => @bitCast(@field(data, field_name)),
++            i32, Air.Call.Flags, Air.CondBr.BranchHints, Air.Asm.Flags => @bitCast(@field(data, field_name)),
+             Air.Inst.Ref, InternPool.Index => @backingInt(@field(data, field_name)),
+             else => @compileError("bad field type: " ++ @typeName(field_type)),
+diff --git a/src/Air/Legalize.zig b/src/Air/Legalize.zig
+--- a/src/Air/Legalize.zig
++++ b/src/Air/Legalize.zig
+@@ -3066,3 +3066,6 @@ const Block = struct {
+                 .operand = Air.internedToRef(panic_fn_val),
+-                .payload = try l.addExtra(Air.Call, .{ .args_len = 0 }),
++                .payload = try l.addExtra(Air.Call, .{
++                    .args_len = 0,
++                    .flags = .{ .safety_check = true },
++                }),
+             } },
+@@ -3355,3 +3358,4 @@ fn addExtra(l: *Legalize, comptime Extra: type, extra: Extra) Error!u32 {
+         u32 => @field(extra, field_name),
++        Air.Call.Flags => @bitCast(@field(extra, field_name)),
+         Air.Inst.Ref => @backingInt(@field(extra, field_name)),
+         else => @compileError(@typeName(field_type)),

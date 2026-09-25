@@ -1,0 +1,13 @@
+{
+  "checks": [
+    "test"
+  ],
+  "consumer_module": "choir",
+  "language": "zig",
+  "libraries": [],
+  "library": true,
+  "name": "choir",
+  "root": ".",
+  "version": "v26.6.2",
+  "zig": "0.17.0-dev.1465+8b2d0ce21"
+}

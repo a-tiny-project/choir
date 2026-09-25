@@ -1,0 +1,29 @@
+.{
+    .name = .choir,
+    .version = "26.6.2",
+    .fingerprint = 0xaf9d698f2ab8c766,
+    .minimum_zig_version = "0.17.0-dev.1465+8b2d0ce21",
+    .dependencies = .{
+        .build_api = .{ .path = "deps/build/api" },
+        .alloc = .{
+            .path = "deps/lib/alloc",
+        },
+        .alloc_arena = .{ .path = "deps/lib/alloc/arena" },
+        .alloc_fixed = .{ .path = "deps/lib/alloc/fixed" },
+        .sys = .{ .path = "deps/lib/sys" },
+        .isa = .{ .path = "deps/lib/isa" },
+        .simd = .{ .path = "deps/lib/simd" },
+        .pretty = .{
+            .path = "deps/lib/pretty",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "build",
+        "src",
+        "deps",
+        "LICENSE",
+        "README.md",
+    },
+}

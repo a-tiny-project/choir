@@ -1,0 +1,1815 @@
+diff --git a/lib/compiler/Maker/Step/Compile.zig b/lib/compiler/Maker/Step/Compile.zig
+index 3fc6cf0c..fc2a1e56 100644
+--- a/lib/compiler/Maker/Step/Compile.zig
++++ b/lib/compiler/Maker/Step/Compile.zig
+@@ -18,6 +18,7 @@ const stardust_build_repository_root_env = "TINY_STARDUST_REPOSITORY_ROOT";
+ const stardust_unit_json_bytes_max = 64 * 1024;
+ const stardust_unit_path_bytes_max = 1024;
+ const stardust_unit_text_bytes_max = 512;
++const stardust_partition_census_suffix = ".partition.json";
+
+ const Step = @import("../Step.zig");
+ const Maker = @import("../../Maker.zig");
+@@ -172,6 +173,7 @@ const StardustBuildTicket = struct {
+     plugin_path: ?[]const u8,
+     artifact_path: ?[]const u8,
+     expected_compile_error_path: ?[]const u8,
++    unit_identity: [Sha256.digest_length * 2]u8,
+
+     fn appendObserverArgs(
+         ticket: StardustBuildTicket,
+@@ -183,13 +185,15 @@ const StardustBuildTicket = struct {
+         try zig_args.appendSlice(gpa, &.{
+             try arena.print("-fstardust-plugin={s}", .{ticket.plugin_path.?}),
+             try arena.print("-fstardust-output={s}", .{artifact_path}),
++            try arena.print("-fstardust-unit={s}", .{ticket.unit_identity}),
+         });
+     }
+
+     fn observerArgsLength(ticket: StardustBuildTicket) usize {
+         const artifact_path = ticket.artifact_path orelse return 0;
+         return "-fstardust-plugin=".len + ticket.plugin_path.?.len + 1 +
+-            "-fstardust-output=".len + artifact_path.len + 1;
++            "-fstardust-output=".len + artifact_path.len + 1 +
++            "-fstardust-unit=".len + ticket.unit_identity.len + 1;
+     }
+
+     fn markExpectedCompileError(
+@@ -238,6 +242,32 @@ const StardustBuildTicket = struct {
+                 .{ artifact_path, stat.kind, stat.size },
+             );
+         }
++        var partition_path_storage: [Dir.max_path_bytes]u8 = undefined;
++        const partition_path = std.fmt.bufPrint(
++            &partition_path_storage,
++            "{s}{s}",
++            .{ artifact_path, stardust_partition_census_suffix },
++        ) catch return maker.stepByIndex(compile_index).fail(
++            maker,
++            "Stardust partition census path exceeds the compiler path capacity",
++            .{},
++        );
++        const partition_stat = Dir.cwd().statFile(
++            maker.graph.io,
++            partition_path,
++            .{ .follow_symlinks = false },
++        ) catch |err| return maker.stepByIndex(compile_index).fail(
++            maker,
++            "Stardust build compiler produced no partition census at {q}: {t}",
++            .{ partition_path, err },
++        );
++        if (partition_stat.kind != .file or partition_stat.size == 0) {
++            return maker.stepByIndex(compile_index).fail(
++                maker,
++                "Stardust partition census {q} must be a non-empty regular file; found {t} with {d} bytes",
++                .{ partition_path, partition_stat.kind, partition_stat.size },
++            );
++        }
+     }
+ };
+
+@@ -256,6 +286,12 @@ const StardustOptimizeMode = enum(u2) {
+     small,
+ };
+
++const StardustArgumentCommitment = struct {
++    count: u32,
++    bytes: u64,
++    sha256: []const u8,
++};
++
+ const StardustUnit = struct {
+     schema: u32,
+     registered_root: []const u8,
+@@ -268,10 +304,110 @@ const StardustUnit = struct {
+     object_format: []const u8,
+     dynamic_linker: ?[]const u8,
+     optimize: StardustOptimizeMode,
++    declarations: StardustArgumentCommitment,
++    invocation: StardustArgumentCommitment,
++};
++
++const StardustIdentityBuilder = struct {
++    state: Sha256,
++
++    fn init(domain: []const u8) StardustIdentityBuilder {
++        var builder = StardustIdentityBuilder{ .state = Sha256.init(.{}) };
++        builder.addBytes(domain);
++        return builder;
++    }
++
++    fn addBytes(builder: *StardustIdentityBuilder, bytes: []const u8) void {
++        var length: [@sizeOf(u64)]u8 = undefined;
++        mem.writeInt(u64, &length, bytes.len, .little);
++        builder.state.update(&length);
++        builder.state.update(bytes);
++    }
++
++    fn addU8(builder: *StardustIdentityBuilder, value: u8) void {
++        builder.addInteger(u8, value);
++    }
++
++    fn addU32(builder: *StardustIdentityBuilder, value: u32) void {
++        builder.addInteger(u32, value);
++    }
++
++    fn addU64(builder: *StardustIdentityBuilder, value: u64) void {
++        builder.addInteger(u64, value);
++    }
++
++    fn addInteger(
++        builder: *StardustIdentityBuilder,
++        comptime T: type,
++        value: T,
++    ) void {
++        var encoded: [@sizeOf(T)]u8 = undefined;
++        mem.writeInt(T, &encoded, value, .little);
++        builder.addBytes(&encoded);
++    }
++
++    fn finish(
++        builder: *StardustIdentityBuilder,
++    ) [Sha256.digest_length * 2]u8 {
++        var digest: [Sha256.digest_length]u8 = undefined;
++        builder.state.final(&digest);
++        return std.fmt.bytesToHex(digest, .lower);
++    }
+ };
+
+ const StardustBuildIdentity = [Sha256.digest_length * 2]u8;
+
++fn stardustArgumentCommitment(
++    domain: []const u8,
++    arguments: []const []const u8,
++    digest_storage: *[Sha256.digest_length * 2]u8,
++) !StardustArgumentCommitment {
++    const count = std.math.cast(u32, arguments.len) orelse
++        return error.OutOfMemory;
++    var bytes: u64 = 0;
++    var builder = StardustIdentityBuilder.init(domain);
++    builder.addU32(count);
++    for (arguments) |argument| {
++        bytes = std.math.add(u64, bytes, argument.len) catch
++            return error.OutOfMemory;
++        builder.addBytes(argument);
++    }
++    digest_storage.* = builder.finish();
++    return .{
++        .count = count,
++        .bytes = bytes,
++        .sha256 = digest_storage,
++    };
++}
++
++fn stardustUnitIdentity(unit: StardustUnit) StardustBuildIdentity {
++    var builder = StardustIdentityBuilder.init(
++        "tiny.stardust.build-unit/v2/v1",
++    );
++    builder.addU32(unit.schema);
++    builder.addBytes(unit.registered_root);
++    builder.addBytes(unit.build_root);
++    builder.addBytes(unit.root_source);
++    builder.addBytes(unit.root_name);
++    builder.addU8(@backingInt(unit.kind));
++    builder.addBytes(unit.target);
++    builder.addBytes(unit.cpu);
++    builder.addBytes(unit.object_format);
++    if (unit.dynamic_linker) |dynamic_linker| {
++        builder.addU8(1);
++        builder.addBytes(dynamic_linker);
++    } else {
++        builder.addU8(0);
++    }
++    builder.addU8(@backingInt(unit.optimize));
++    inline for (.{ unit.declarations, unit.invocation }) |commitment| {
++        builder.addU32(commitment.count);
++        builder.addU64(commitment.bytes);
++        builder.addBytes(commitment.sha256);
++    }
++    return builder.finish();
++}
++
+ fn stardustBuildIdentity(
+     maker: *const Maker,
+     compile_index: Configuration.Step.Index,
+@@ -510,8 +646,38 @@ fn prepareStardustBuildTicket(
+             .{},
+         );
+     }
++    if (zig_args.items.len < 3 or
++        !mem.eql(u8, zig_args.items[zig_args.items.len - 1], "--listen=-"))
++    {
++        return step.fail(
++            maker,
++            "Stardust build invocation is not in canonical Maker form",
++            .{},
++        );
++    }
++    const persistent = maker.watch and
++        (conf_comp.flags4.incremental.toBool() orelse graph.incremental == true);
++    if (conf_comp.flags4.expect_errors == .none and !persistent) {
++        try zig_args.insert(
++            maker.gpa,
++            zig_args.items.len - 1,
++            "-fstardust-whole-cache",
++        );
++    }
++    var declaration_digest: [Sha256.digest_length * 2]u8 = undefined;
++    const declarations = try stardustArgumentCommitment(
++        "tiny.stardust.build-declarations/v1",
++        zig_args.items[1 .. zig_args.items.len - 1],
++        &declaration_digest,
++    );
++    var invocation_digest: [Sha256.digest_length * 2]u8 = undefined;
++    const invocation = try stardustArgumentCommitment(
++        "tiny.stardust.build-invocation/v1",
++        zig_args.items[1..],
++        &invocation_digest,
++    );
+     const unit = StardustUnit{
+-        .schema = 1,
++        .schema = 2,
+         .registered_root = registered_root.?,
+         .build_root = build_root,
+         .root_source = root_source,
+@@ -533,7 +699,10 @@ fn prepareStardustBuildTicket(
+             .fast => .fast,
+             .small => .small,
+         },
++        .declarations = declarations,
++        .invocation = invocation,
+     };
++    const unit_identity = stardustUnitIdentity(unit);
+
+     const expected_path = try Dir.path.join(arena, &.{
+         session_dir.?,
+@@ -599,12 +768,14 @@ fn prepareStardustBuildTicket(
+         .plugin_path = null,
+         .artifact_path = null,
+         .expected_compile_error_path = expected_compile_error_path,
++        .unit_identity = unit_identity,
+     };
+
+     return .{
+         .plugin_path = plugin_path.?,
+         .artifact_path = artifact_path,
+         .expected_compile_error_path = null,
++        .unit_identity = unit_identity,
+     };
+ }
+
+diff --git a/src/Compilation.zig b/src/Compilation.zig
+index 59c1fe4c..2e836963 100644
+--- a/src/Compilation.zig
++++ b/src/Compilation.zig
+@@ -2413,7 +2413,12 @@ pub fn create(gpa: Allocator, arena: Allocator, io: Io, diag: *CreateDiagnostic,
+                     try comp.oneshot_prelink_tasks.ensureUnusedCapacity(gpa, field_names.len + 1);
+                     inline for (field_names) |field_name| {
+                         if (@field(paths, field_name)) |path| {
+-                            comp.oneshot_prelink_tasks.appendAssumeCapacity(.{ .load_object = path });
++                            comp.oneshot_prelink_tasks.appendAssumeCapacity(.{
++                                .load_object = .{
++                                    .path = path,
++                                    .origin = .startup,
++                                },
++                            });
+                         }
+                     }
+                     // Loads the libraries provided by `target_util.libcFullLinkFlags(target)`.
+@@ -3269,7 +3274,10 @@ fn flush(comp: *Compilation, arena: Allocator) (Io.Cancelable || Allocator.Error
+
+             if (zcu_obj_path) |path| {
+                 // Tell the linker backend about the ZCU object emitted by LLVM.
+-                link.doPrelinkTask(comp, .{ .load_object = path });
++                link.doPrelinkTask(comp, .{ .load_object = .{
++                    .path = path,
++                    .origin = .source_document,
++                } });
+                 // `link.Queue` has not called `prelink` because it knew we would want to send that
+                 // final link input. It is *our* responsibility to call `prelink` now we're done.
+                 comp.bin_file.?.prelink() catch |err| switch (err) {
+@@ -3294,7 +3302,7 @@ fn flush(comp: *Compilation, arena: Allocator) (Io.Cancelable || Allocator.Error
+     }
+     if (comp.stardust_plugin) |*plugin| {
+         if (comp.zcu) |zcu| {
+-            plugin.flush(zcu, tid) catch comp.lockAndSetMiscFailure(
++            plugin.flush(comp, zcu, tid) catch comp.lockAndSetMiscFailure(
+                 .stardust_plugin,
+                 "Stardust plugin flush failed: {f}",
+                 .{plugin.failureCause()},
+@@ -3369,6 +3377,8 @@ fn addNonIncrementalStuffToCacheManifest(
+     if (comp.config.stardust_plugin_path) |plugin_path| {
+         _ = try man.addFile(plugin_path, null);
+         man.hash.add(comp.config.stardust_claim_metadata);
++        man.hash.addOptionalBytes(comp.config.stardust_unit_identity);
++        man.hash.add(comp.config.incremental);
+         man.hash.addOptionalBytes(comp.environ_map.get("TINY_STARDUST_LIMITS"));
+         man.hash.addOptionalBytes(comp.environ_map.get("TINY_STARDUST_REPOSITORY_ROOT"));
+     }
+@@ -5345,6 +5355,7 @@ fn buildMingwImportLib(comp: *Compilation, lib_name: []const u8, is_prelink: boo
+             .load_archive = .{
+                 .path = crt_file_path,
+                 .must_link = false,
++                .origin = .runtime,
+             },
+         }}) catch |err| comp.lockAndSetMiscFailure(
+             .windows_import_lib,
+@@ -5815,7 +5826,10 @@ fn updateCObject(comp: *Compilation, c_object: *CObject, c_obj_prog_node: std.Pr
+         },
+     };
+
+-    try comp.queuePrelinkTasks(&.{.{ .load_object = c_object.status.success.object_path }});
++    try comp.queuePrelinkTasks(&.{.{ .load_object = .{
++        .path = c_object.status.success.object_path,
++        .origin = .foreign,
++    } }});
+ }
+
+ fn updateWin32Resource(comp: *Compilation, win32_resource: *Win32Resource, win32_resource_prog_node: std.Progress.Node) !void {
+@@ -7301,6 +7315,21 @@ fn buildOutputFromZig(
+
+     const strip = comp.compilerRtStrip();
+     const optimize_mode = comp.compilerRtOptMode();
++    const generated_child_role: link.GeneratedChildRole = switch (misc_task_tag) {
++        .compiler_rt => .compiler_rt,
++        .libubsan => .libubsan,
++        .libfuzzer => .libfuzzer,
++        .libzigc => .libzigc,
++        else => unreachable,
++    };
++    const stardust_output_path = if (comp.config.stardust_output_path) |parent|
++        try std.fmt.allocPrint(
++            arena,
++            "{s}.member-{s}.choir",
++            .{ parent, @tagName(generated_child_role) },
++        )
++    else
++        null;
+
+     const config = Config.resolve(.{
+         .output_mode = output_mode,
+@@ -7316,6 +7345,10 @@ fn buildOutputFromZig(
+         .any_error_tracing = false,
+         .root_error_tracing = false,
+         .lto = if (options.allow_lto) comp.config.lto else .none,
++        .stardust_plugin_path = comp.config.stardust_plugin_path,
++        .stardust_output_path = stardust_output_path,
++        .stardust_unit_identity = comp.config.stardust_unit_identity,
++        .stardust_claim_metadata = comp.config.stardust_claim_metadata,
+     }) catch |err| {
+         comp.lockAndSetMiscFailure(misc_task_tag, "sub-compilation of {t} failed: failed to resolve compilation config: {t}", .{ misc_task_tag, err });
+         return error.AlreadyReported;
+@@ -7405,7 +7438,13 @@ fn buildOutputFromZig(
+     assert(out.* == null);
+     out.* = crt_file;
+
+-    try comp.queuePrelinkTaskMode(crt_file.full_object_path, false, &config);
++    try comp.queuePrelinkTaskMode(
++        crt_file.full_object_path,
++        false,
++        .runtime,
++        generated_child_role,
++        &config,
++    );
+ }
+
+ pub const CrtFileOptions = struct {
+@@ -7540,7 +7579,17 @@ pub fn build_crt_file(
+     try comp.updateSubCompilation(sub_compilation, misc_task_tag, prog_node);
+
+     const crt_file = try sub_compilation.toCrtFile();
+-    try comp.queuePrelinkTaskMode(crt_file.full_object_path, false, &config);
++    try comp.queuePrelinkTaskMode(
++        crt_file.full_object_path,
++        false,
++        switch (output_mode) {
++            .Obj => .startup,
++            .Lib => .runtime,
++            .Exe => unreachable,
++        },
++        null,
++        &config,
++    );
+
+     {
+         comp.mutex.lockUncancelable(io);
+@@ -7552,13 +7601,33 @@ pub fn build_crt_file(
+
+ /// If `must_link` is set, then static library inputs will have all member objects linked into the
+ /// output, instead of only those required to resolve symbol references.
+-pub fn queuePrelinkTaskMode(comp: *Compilation, path: Cache.Path, must_link: bool, config: *const Compilation.Config) Io.Cancelable!void {
++pub fn queuePrelinkTaskMode(
++    comp: *Compilation,
++    path: Cache.Path,
++    must_link: bool,
++    origin: link.PrelinkInputOrigin,
++    child: ?link.GeneratedChildRole,
++    config: *const Compilation.Config,
++) Io.Cancelable!void {
+     try comp.queuePrelinkTasks(switch (config.output_mode) {
+         .Exe => unreachable,
+-        .Obj => &.{.{ .load_object = path }},
++        .Obj => &.{.{ .load_object = .{
++            .path = path,
++            .origin = origin,
++            .child = child,
++        } }},
+         .Lib => &.{switch (config.link_mode) {
+-            .static => .{ .load_archive = .{ .path = path, .must_link = must_link } },
+-            .dynamic => .{ .load_dso = path },
++            .static => .{ .load_archive = .{
++                .path = path,
++                .must_link = must_link,
++                .origin = origin,
++                .child = child,
++            } },
++            .dynamic => .{ .load_dso = .{
++                .path = path,
++                .origin = origin,
++                .child = child,
++            } },
+         }},
+     });
+ }
+diff --git a/src/Compilation/Config.zig b/src/Compilation/Config.zig
+index a350385d..91ff5cfc 100644
+--- a/src/Compilation/Config.zig
++++ b/src/Compilation/Config.zig
+@@ -67,6 +67,7 @@ rdynamic: bool,
+ san_cov_trace_pc_guard: bool,
+ stardust_plugin_path: ?[]const u8,
+ stardust_output_path: ?[]const u8,
++stardust_unit_identity: ?[]const u8,
+ stardust_claim_metadata: bool,
+
+ pub const CFrontend = enum { clang, aro };
+@@ -122,6 +123,7 @@ pub const Options = struct {
+     san_cov_trace_pc_guard: bool = false,
+     stardust_plugin_path: ?[]const u8 = null,
+     stardust_output_path: ?[]const u8 = null,
++    stardust_unit_identity: ?[]const u8 = null,
+     stardust_claim_metadata: bool = true,
+ };
+
+@@ -155,6 +157,8 @@ pub const ResolveError = error{
+     SanitizeThreadRequiresLlvmBackend,
+     BackendLacksErrorTracing,
+     StardustOutputRequiresPlugin,
++    StardustUnitRequiresPlugin,
++    InvalidStardustUnitIdentity,
+     LlvmLibraryUnavailable,
+     LldUnavailable,
+     ClangUnavailable,
+@@ -166,6 +170,15 @@ pub const ResolveError = error{
+ pub fn resolve(options: Options) ResolveError!Config {
+     if (options.stardust_output_path != null and options.stardust_plugin_path == null)
+         return error.StardustOutputRequiresPlugin;
++    if (options.stardust_unit_identity != null and options.stardust_plugin_path == null)
++        return error.StardustUnitRequiresPlugin;
++    if (options.stardust_unit_identity) |identity| {
++        if (identity.len != 64) return error.InvalidStardustUnitIdentity;
++        for (identity) |byte| switch (byte) {
++            '0'...'9', 'a'...'f' => {},
++            else => return error.InvalidStardustUnitIdentity,
++        };
++    }
+
+     const target = &options.resolved_target.result;
+
+@@ -586,6 +599,7 @@ pub fn resolve(options: Options) ResolveError!Config {
+             options.stardust_output_path orelse "stardust.snapshot"
+         else
+             null,
++        .stardust_unit_identity = options.stardust_unit_identity,
+         .stardust_claim_metadata = options.stardust_claim_metadata,
+     };
+ }
+diff --git a/src/libs/freebsd.zig b/src/libs/freebsd.zig
+index fd8e80a7..a62cbcb7 100644
+--- a/src/libs/freebsd.zig
++++ b/src/libs/freebsd.zig
+@@ -1017,7 +1017,10 @@ fn queueSharedObjects(comp: *Compilation, so_files: BuiltSharedObjects) std.Io.C
+                     so_files.dir_path.sub_path, path.sep, lib.name, lib.getSoVersion(&target.os),
+                 }) catch return comp.setAllocFailure(),
+             };
+-            task_buffer[task_buffer_i] = .{ .load_dso = so_path };
++            task_buffer[task_buffer_i] = .{ .load_dso = .{
++                .path = so_path,
++                .origin = .runtime,
++            } };
+             task_buffer_i += 1;
+         }
+     }
+diff --git a/src/libs/glibc.zig b/src/libs/glibc.zig
+index a23757c2..9b6bae85 100644
+--- a/src/libs/glibc.zig
++++ b/src/libs/glibc.zig
+@@ -1166,7 +1166,10 @@ fn queueSharedObjects(comp: *Compilation, so_files: BuiltSharedObjects) std.Io.C
+                     so_files.dir_path.sub_path, path.sep, lib.name, lib.sover,
+                 }) catch return comp.setAllocFailure(),
+             };
+-            task_buffer[task_buffer_i] = .{ .load_dso = so_path };
++            task_buffer[task_buffer_i] = .{ .load_dso = .{
++                .path = so_path,
++                .origin = .runtime,
++            } };
+             task_buffer_i += 1;
+         }
+     }
+diff --git a/src/libs/libcxx.zig b/src/libs/libcxx.zig
+index 4036cec8..9e8388d6 100644
+--- a/src/libs/libcxx.zig
++++ b/src/libs/libcxx.zig
+@@ -295,7 +295,13 @@ pub fn buildLibCxx(comp: *Compilation, prog_node: std.Progress.Node) BuildError!
+     assert(comp.libcxx_static_lib == null);
+     const crt_file = try sub_compilation.toCrtFile();
+     comp.libcxx_static_lib = crt_file;
+-    try comp.queuePrelinkTaskMode(crt_file.full_object_path, false, &config);
++    try comp.queuePrelinkTaskMode(
++        crt_file.full_object_path,
++        false,
++        .runtime,
++        null,
++        &config,
++    );
+ }
+
+ pub fn buildLibCxxAbi(comp: *Compilation, prog_node: std.Progress.Node) BuildError!void {
+@@ -492,7 +498,13 @@ pub fn buildLibCxxAbi(comp: *Compilation, prog_node: std.Progress.Node) BuildErr
+     assert(comp.libcxxabi_static_lib == null);
+     const crt_file = try sub_compilation.toCrtFile();
+     comp.libcxxabi_static_lib = crt_file;
+-    try comp.queuePrelinkTaskMode(crt_file.full_object_path, false, &config);
++    try comp.queuePrelinkTaskMode(
++        crt_file.full_object_path,
++        false,
++        .runtime,
++        null,
++        &config,
++    );
+ }
+
+ pub fn addCxxArgs(
+diff --git a/src/libs/libtsan.zig b/src/libs/libtsan.zig
+index cb15557c..1eff5b75 100644
+--- a/src/libs/libtsan.zig
++++ b/src/libs/libtsan.zig
+@@ -325,7 +325,13 @@ pub fn buildTsan(comp: *Compilation, prog_node: std.Progress.Node) BuildError!vo
+
+     // libtsan contains `.preinit_array` entries that must run for correctness, hence `must_link = true`.
+     const crt_file = try sub_compilation.toCrtFile();
+-    try comp.queuePrelinkTaskMode(crt_file.full_object_path, true, &config);
++    try comp.queuePrelinkTaskMode(
++        crt_file.full_object_path,
++        true,
++        .runtime,
++        null,
++        &config,
++    );
+     assert(comp.tsan_lib == null);
+     comp.tsan_lib = crt_file;
+ }
+diff --git a/src/libs/libunwind.zig b/src/libs/libunwind.zig
+index 46c4b033..d75c1e98 100644
+--- a/src/libs/libunwind.zig
++++ b/src/libs/libunwind.zig
+@@ -179,7 +179,13 @@ pub fn buildStaticLib(comp: *Compilation, prog_node: std.Progress.Node) BuildErr
+     };
+
+     const crt_file = try sub_compilation.toCrtFile();
+-    try comp.queuePrelinkTaskMode(crt_file.full_object_path, false, &config);
++    try comp.queuePrelinkTaskMode(
++        crt_file.full_object_path,
++        false,
++        .runtime,
++        null,
++        &config,
++    );
+     assert(comp.libunwind_static_lib == null);
+     comp.libunwind_static_lib = crt_file;
+ }
+diff --git a/src/libs/musl.zig b/src/libs/musl.zig
+index 3d32cc98..e04a81d4 100644
+--- a/src/libs/musl.zig
++++ b/src/libs/musl.zig
+@@ -275,7 +275,13 @@ pub fn buildCrtFile(comp: *Compilation, in_crt_file: CrtFile, prog_node: std.Pro
+             errdefer comp.gpa.free(basename);
+
+             const crt_file = try sub_compilation.toCrtFile();
+-            try comp.queuePrelinkTaskMode(crt_file.full_object_path, false, &config);
++            try comp.queuePrelinkTaskMode(
++                crt_file.full_object_path,
++                false,
++                .runtime,
++                null,
++                &config,
++            );
+             {
+                 comp.mutex.lockUncancelable(io);
+                 defer comp.mutex.unlock(io);
+diff --git a/src/libs/netbsd.zig b/src/libs/netbsd.zig
+index 3b716236..a36da765 100644
+--- a/src/libs/netbsd.zig
++++ b/src/libs/netbsd.zig
+@@ -671,7 +671,10 @@ fn queueSharedObjects(comp: *Compilation, so_files: BuiltSharedObjects) std.Io.C
+                     so_files.dir_path.sub_path, path.sep, lib.name, lib.sover,
+                 }) catch return comp.setAllocFailure(),
+             };
+-            task_buffer[task_buffer_i] = .{ .load_dso = so_path };
++            task_buffer[task_buffer_i] = .{ .load_dso = .{
++                .path = so_path,
++                .origin = .runtime,
++            } };
+             task_buffer_i += 1;
+         }
+     }
+diff --git a/src/libs/openbsd.zig b/src/libs/openbsd.zig
+index 7f6dc2db..2626ba33 100644
+--- a/src/libs/openbsd.zig
++++ b/src/libs/openbsd.zig
+@@ -592,7 +592,10 @@ fn queueSharedObjects(comp: *Compilation, so_files: BuiltSharedObjects) std.Io.C
+                     so_files.dir_path.sub_path, path.sep, lib.name,
+                 }) catch return comp.setAllocFailure(),
+             };
+-            task_buffer[task_buffer_i] = .{ .load_dso = so_path };
++            task_buffer[task_buffer_i] = .{ .load_dso = .{
++                .path = so_path,
++                .origin = .runtime,
++            } };
+             task_buffer_i += 1;
+         }
+     }
+diff --git a/src/link.zig b/src/link.zig
+index 84cbcbdc..fd19b813 100644
+--- a/src/link.zig
++++ b/src/link.zig
+@@ -1401,6 +1401,21 @@ pub const File = struct {
+     pub const Dwarf = @import("link/Dwarf.zig");
+ };
+
++pub const PrelinkInputOrigin = enum {
++    source_document,
++    startup,
++    runtime,
++    foreign,
++    unknown,
++};
++
++pub const GeneratedChildRole = enum {
++    compiler_rt,
++    libubsan,
++    libfuzzer,
++    libzigc,
++};
++
+ pub const PrelinkTask = union(enum) {
+     /// Loads the objects, shared objects, and archives that are already
+     /// known from the command line.
+@@ -1410,15 +1425,25 @@ pub const PrelinkTask = union(enum) {
+     /// installation.
+     load_host_libc,
+     /// Tells the linker to load an object file by path.
+-    load_object: Path,
++    load_object: struct {
++        path: Path,
++        origin: PrelinkInputOrigin,
++        child: ?GeneratedChildRole = null,
++    },
+     /// Tells the linker to load a static library by path.
+     load_archive: struct {
+         path: Path,
+         must_link: bool,
++        origin: PrelinkInputOrigin,
++        child: ?GeneratedChildRole = null,
+     },
+     /// Tells the linker to load a shared library, possibly one that is a
+     /// GNU ld script.
+-    load_dso: Path,
++    load_dso: struct {
++        path: Path,
++        origin: PrelinkInputOrigin,
++        child: ?GeneratedChildRole = null,
++    },
+ };
+ pub const ZcuTask = union(enum) {
+     /// Write the constant value for a Decl to the output file.
+@@ -1442,6 +1467,15 @@ pub fn doPrelinkTask(comp: *Compilation, task: PrelinkTask) void {
+         comp.link_prog_node.completeOne();
+         return;
+     };
++    if (comp.stardust_plugin) |*plugin| {
++        plugin.recordPrelinkTask(task, comp.link_inputs) catch |err| {
++            diags.addError(
++                "failed to capture Stardust partition member before linking: {s}",
++                .{@errorName(err)},
++            );
++            return;
++        };
++    }
+
+     // The guard on this assertion is a temporary hack to make the LLVM backend with LLD work with
+     // `-fincremental`. This works only because `File.Lld` does nothing in prelink.
+@@ -1461,7 +1495,7 @@ pub fn doPrelinkTask(comp: *Compilation, task: PrelinkTask) void {
+         .load_explicitly_provided => {
+             const prog_node = comp.link_prog_node.start("Parse Inputs", comp.link_inputs.len);
+             defer prog_node.end();
+-            for (comp.link_inputs) |input| {
++            for (comp.link_inputs, 0..) |input, input_index| {
+                 base.loadInput(input) catch |err| switch (err) {
+                     error.AlreadyReported => return, // error reported via diags
+                     else => |e| switch (input) {
+@@ -1472,6 +1506,15 @@ pub fn doPrelinkTask(comp: *Compilation, task: PrelinkTask) void {
+                         .dso_exact => diags.addError("failed to handle dso_exact: {s}", .{@errorName(e)}),
+                     },
+                 };
++                if (comp.stardust_plugin) |*plugin| {
++                    plugin.confirmExplicitInput(input, input_index) catch |err| {
++                        diags.addError(
++                            "Stardust partition member changed while linking: {s}",
++                            .{@errorName(err)},
++                        );
++                        return;
++                    };
++                }
+                 prog_node.completeOne();
+             }
+         },
+@@ -1583,12 +1626,12 @@ pub fn doPrelinkTask(comp: *Compilation, task: PrelinkTask) void {
+                 }
+             }
+         },
+-        .load_object => |path| {
++        .load_object => |object| {
+             const prog_node = comp.link_prog_node.start("Parse Object", 0);
+             defer prog_node.end();
+-            base.openLoadObject(path) catch |err| switch (err) {
++            base.openLoadObject(object.path) catch |err| switch (err) {
+                 error.AlreadyReported => return, // error reported via diags
+-                else => |e| diags.addParseError(path, "failed to parse object: {s}", .{@errorName(e)}),
++                else => |e| diags.addParseError(object.path, "failed to parse object: {s}", .{@errorName(e)}),
+             };
+         },
+         .load_archive => |load_archive| {
+@@ -1599,15 +1642,15 @@ pub fn doPrelinkTask(comp: *Compilation, task: PrelinkTask) void {
+                 else => |e| diags.addParseError(load_archive.path, "failed to parse archive: {s}", .{@errorName(e)}),
+             };
+         },
+-        .load_dso => |path| {
++        .load_dso => |dso| {
+             const prog_node = comp.link_prog_node.start("Parse Shared Library", 0);
+             defer prog_node.end();
+-            base.openLoadDso(path, .{
++            base.openLoadDso(dso.path, .{
+                 .preferred_mode = .dynamic,
+                 .search_strategy = .paths_first,
+             }) catch |err| switch (err) {
+                 error.AlreadyReported => return, // error reported via link_diags
+-                else => |e| diags.addParseError(path, "failed to parse shared library: {s}", .{@errorName(e)}),
++                else => |e| diags.addParseError(dso.path, "failed to parse shared library: {s}", .{@errorName(e)}),
+             };
+         },
+     }
+diff --git a/src/main.zig b/src/main.zig
+index 27e6008e..d49df611 100644
+--- a/src/main.zig
++++ b/src/main.zig
+@@ -541,6 +541,8 @@ const usage_build_generic =
+     \\  --error-limit [num]       Set the maximum amount of distinct error values
+     \\  -fstardust-plugin=[path]    Analyze post-Sema AIR with a dynamic plugin
+     \\  -fstardust-output=[path]    Write plugin output to path
++    \\  -fstardust-unit=[sha256]     Bind plugin output to the Maker build unit
++    \\  -fstardust-whole-cache     Cache one-shot captures with all compiler inputs
+     \\  -f[no-]stardust-claim-metadata  Record comptime claim metadata for the plugin
+     \\  -fllvm                    Force using LLVM as the codegen backend
+     \\  -fno-llvm                 Prevent using LLVM as the codegen backend
+@@ -911,6 +913,7 @@ fn buildOutputType(
+     var listen: Listen = .none;
+     var debug_compile_errors = false;
+     var debug_incremental = false;
++    var stardust_whole_cache = false;
+     var verbose_link = (native_os != .wasi or builtin.link_libc) and
+         EnvVar.ZIG_VERBOSE_LINK.isSet(environ_map);
+     var verbose_cc = (native_os != .wasi or builtin.link_libc) and
+@@ -1388,10 +1391,14 @@ fn buildOutputType(
+                         create_module.opts.stardust_plugin_path = rest;
+                     } else if (mem.cutPrefix(u8, arg, "-fstardust-output=")) |rest| {
+                         create_module.opts.stardust_output_path = rest;
++                    } else if (mem.cutPrefix(u8, arg, "-fstardust-unit=")) |rest| {
++                        create_module.opts.stardust_unit_identity = rest;
+                     } else if (mem.eql(u8, arg, "-fstardust-claim-metadata")) {
+                         create_module.opts.stardust_claim_metadata = true;
+                     } else if (mem.eql(u8, arg, "-fno-stardust-claim-metadata")) {
+                         create_module.opts.stardust_claim_metadata = false;
++                    } else if (mem.eql(u8, arg, "-fstardust-whole-cache")) {
++                        stardust_whole_cache = true;
+                     } else if (mem.cutPrefix(u8, arg, "-mcpu=")) |rest| {
+                         target_mcpu = rest;
+                     } else if (mem.cutPrefix(u8, arg, "-O")) |rest| {
+@@ -3579,11 +3586,17 @@ fn buildOutputType(
+     if (debug_incremental and !incremental) {
+         fatal("--debug-incremental requires -fincremental", .{});
+     }
++    if (stardust_whole_cache and
++        (create_module.resolved_options.stardust_plugin_path == null or output_to_cache == null))
++    {
++        fatal("-fstardust-whole-cache requires an observed compilation with cached output", .{});
++    }
+
+     const cache_mode: Compilation.CacheMode = b: {
+         // Once incremental compilation is the default, we'll want some smarter logic here,
+         // considering things like the backend in use and whether there's a ZCU.
+         if (output_to_cache == null) break :b .none;
++        if (stardust_whole_cache) break :b .whole;
+         if (incremental) break :b .incremental;
+         break :b .whole;
+     };
+@@ -4246,6 +4259,8 @@ fn createModule(
+             error.SanitizeThreadRequiresLlvmBackend => fatal("thread sanitization requires the LLVM backend", .{}),
+             error.BackendLacksErrorTracing => fatal("the selected backend has not yet implemented error return tracing", .{}),
+             error.StardustOutputRequiresPlugin => fatal("-fstardust-output requires -fstardust-plugin", .{}),
++            error.StardustUnitRequiresPlugin => fatal("-fstardust-unit requires -fstardust-plugin", .{}),
++            error.InvalidStardustUnitIdentity => fatal("-fstardust-unit requires 64 lowercase hexadecimal digits", .{}),
+             error.LlvmLibraryUnavailable => fatal("zig was compiled without LLVM libraries", .{}),
+             error.LldUnavailable => fatal("zig was compiled without LLD libraries", .{}),
+             error.ClangUnavailable => fatal("zig was compiled without Clang libraries", .{}),
+diff --git a/src/stardust.zig b/src/stardust.zig
+index 794b958d..5edf7397 100644
+--- a/src/stardust.zig
++++ b/src/stardust.zig
+@@ -8,6 +8,355 @@ const InternPool = @import("InternPool.zig");
+ const Zcu = @import("Zcu.zig");
+ const api = @import("stardust_api.zig");
+
++const CachePath = Cache.Path;
++const Sha256 = std.crypto.hash.sha2.Sha256;
++
++const partition_census_schema = "tiny.stardust.partition-census/v5";
++const partition_census_suffix = ".partition.json";
++const partition_member_capacity: usize = 256;
++const partition_hash_buffer_bytes: usize = 16 * 1024;
++
++const PartitionInputCounts = struct {
++    object: u32 = 0,
++    archive: u32 = 0,
++    resource: u32 = 0,
++    shared_library: u32 = 0,
++    exact_shared_library: u32 = 0,
++};
++
++const PartitionMemberKind = enum(u8) {
++    object,
++    archive,
++    resource,
++    shared_library,
++};
++
++const PartitionMemberOrigin = enum(u8) {
++    explicit,
++    startup,
++    runtime,
++    foreign,
++    unknown,
++};
++
++const GeneratedChildRole = enum(u8) {
++    compiler_rt,
++    libubsan,
++    libfuzzer,
++    libzigc,
++};
++
++const PartitionDeclarationSource = enum(u8) {
++    explicit,
++    prelink,
++    win32_resource,
++};
++
++fn generatedChildRole(child: anytype) ?GeneratedChildRole {
++    const role = child orelse return null;
++    return @fromBackingInt(@intCast(@backingInt(role)));
++}
++
++fn partitionMemberOrigin(origin: anytype) ?PartitionMemberOrigin {
++    return switch (origin) {
++        .source_document => null,
++        .startup => .startup,
++        .runtime => .runtime,
++        .foreign => .foreign,
++        .unknown => .unknown,
++    };
++}
++
++const PartitionMemberCandidate = struct {
++    origin: PartitionMemberOrigin,
++    kind: PartitionMemberKind,
++    path: CachePath,
++    file: ?Io.File = null,
++    content: ?PartitionContentIdentity = null,
++    thin_archive: bool = false,
++    declaration_source: PartitionDeclarationSource = .prelink,
++    declaration_ordinal: ?u32 = null,
++    child: ?GeneratedChildRole = null,
++    must_link: bool = false,
++    hidden: bool = false,
++    needed: bool = false,
++    weak: bool = false,
++    reexport: bool = false,
++};
++
++const GeneratedChildIdentity = struct {
++    role: GeneratedChildRole,
++    snapshot: PartitionContentIdentity,
++    partition_census: PartitionContentIdentity,
++};
++
++const PartitionMemberIdentity = struct {
++    declaration: [Sha256.digest_length]u8,
++    origin: PartitionMemberOrigin,
++    kind: PartitionMemberKind,
++    bytes: u64,
++    sha256: [Sha256.digest_length]u8,
++    occurrences: u32,
++    child: ?GeneratedChildIdentity,
++    must_link: bool,
++    hidden: bool,
++    needed: bool,
++    weak: bool,
++    reexport: bool,
++    exact_authority: bool,
++    thin_archive: bool,
++
++    fn lessThan(
++        _: void,
++        lhs: PartitionMemberIdentity,
++        rhs: PartitionMemberIdentity,
++    ) bool {
++        return std.mem.lessThan(u8, &lhs.declaration, &rhs.declaration);
++    }
++};
++
++const PartitionContentIdentity = struct {
++    bytes: u64,
++    sha256: [Sha256.digest_length]u8,
++};
++
++const PartitionMemberObservation = struct {
++    content: PartitionContentIdentity,
++    thin_archive: bool,
++};
++
++fn partitionContentEql(
++    lhs: PartitionContentIdentity,
++    rhs: PartitionContentIdentity,
++) bool {
++    return lhs.bytes == rhs.bytes and
++        std.mem.eql(u8, &lhs.sha256, &rhs.sha256);
++}
++
++fn partitionObservationEql(
++    lhs: PartitionMemberObservation,
++    rhs: PartitionMemberObservation,
++) bool {
++    return partitionContentEql(lhs.content, rhs.content) and
++        lhs.thin_archive == rhs.thin_archive;
++}
++
++const PartitionIdentityBuilder = struct {
++    state: Sha256,
++
++    fn init(domain: []const u8) PartitionIdentityBuilder {
++        var builder = PartitionIdentityBuilder{ .state = Sha256.init(.{}) };
++        builder.addBytes(domain);
++        return builder;
++    }
++
++    fn addBytes(builder: *PartitionIdentityBuilder, bytes: []const u8) void {
++        var length: [@sizeOf(u64)]u8 = undefined;
++        std.mem.writeInt(u64, &length, bytes.len, .little);
++        builder.state.update(&length);
++        builder.state.update(bytes);
++    }
++
++    fn addU8(builder: *PartitionIdentityBuilder, value: u8) void {
++        builder.addInteger(u8, value);
++    }
++
++    fn addU32(builder: *PartitionIdentityBuilder, value: u32) void {
++        builder.addInteger(u32, value);
++    }
++
++    fn addInteger(
++        builder: *PartitionIdentityBuilder,
++        comptime T: type,
++        value: T,
++    ) void {
++        var encoded: [@sizeOf(T)]u8 = undefined;
++        std.mem.writeInt(T, &encoded, value, .little);
++        builder.addBytes(&encoded);
++    }
++
++    fn finish(builder: *PartitionIdentityBuilder) [Sha256.digest_length]u8 {
++        var digest: [Sha256.digest_length]u8 = undefined;
++        builder.state.final(&digest);
++        return digest;
++    }
++};
++
++fn partitionDeclarationIdentity(
++    unit_identity: []const u8,
++    candidate: PartitionMemberCandidate,
++) [Sha256.digest_length]u8 {
++    var builder = PartitionIdentityBuilder.init(
++        "tiny.stardust.partition-declaration/v1",
++    );
++    builder.addBytes(unit_identity);
++    builder.addU8(@backingInt(candidate.declaration_source));
++    builder.addU32(candidate.declaration_ordinal.?);
++    builder.addU8(@backingInt(candidate.origin));
++    builder.addU8(@backingInt(candidate.kind));
++    if (candidate.path.root_dir.path) |root_path| {
++        builder.addU8(1);
++        builder.addBytes(root_path);
++    } else {
++        builder.addU8(0);
++    }
++    builder.addBytes(candidate.path.sub_path);
++    inline for (.{
++        candidate.must_link,
++        candidate.hidden,
++        candidate.needed,
++        candidate.weak,
++        candidate.reexport,
++    }) |value| builder.addU8(@intFromBool(value));
++    if (candidate.child) |child| {
++        builder.addU8(1);
++        builder.addU8(@backingInt(child));
++    } else {
++        builder.addU8(0);
++    }
++    return builder.finish();
++}
++
++const PartitionContentJson = struct {
++    bytes: u64,
++    sha256: []const u8,
++};
++
++const GeneratedChildJson = struct {
++    role: GeneratedChildRole,
++    snapshot: PartitionContentJson,
++    partition_census: PartitionContentJson,
++};
++
++const PartitionMemberJson = struct {
++    ordinal: u32,
++    declaration: []const u8,
++    origin: PartitionMemberOrigin,
++    kind: PartitionMemberKind,
++    bytes: u64,
++    sha256: []const u8,
++    occurrences: u32,
++    must_link: bool,
++    hidden: bool,
++    needed: bool,
++    weak: bool,
++    reexport: bool,
++    child: ?GeneratedChildJson,
++
++    pub fn jsonStringify(self: PartitionMemberJson, writer: anytype) !void {
++        try writer.beginObject();
++        inline for (.{
++            "ordinal",
++            "declaration",
++            "origin",
++            "kind",
++            "bytes",
++            "sha256",
++            "occurrences",
++            "must_link",
++            "hidden",
++            "needed",
++            "weak",
++            "reexport",
++        }) |name| {
++            try writer.objectField(name);
++            try writer.write(@field(self, name));
++        }
++        if (self.child) |child| {
++            try writer.objectField("child");
++            try writer.write(child);
++        }
++        try writer.endObject();
++    }
++};
++
++const PartitionMemberCapture = struct {
++    recorded: u32,
++    overflowed: bool,
++    host_resolution: bool,
++};
++
++const PartitionMemberTable = struct {
++    mutex: Io.Mutex = .init,
++    rows: [partition_member_capacity]PartitionMemberCandidate = undefined,
++    len: u32 = 0,
++    overflowed: bool = false,
++    host_resolution: bool = false,
++
++    fn reset(self: *PartitionMemberTable, io: Io) void {
++        self.mutex.lockUncancelable(io);
++        defer self.mutex.unlock(io);
++        self.len = 0;
++        self.overflowed = false;
++        self.host_resolution = false;
++    }
++
++    fn append(
++        self: *PartitionMemberTable,
++        io: Io,
++        candidate: PartitionMemberCandidate,
++    ) void {
++        self.mutex.lockUncancelable(io);
++        defer self.mutex.unlock(io);
++        if (self.len == partition_member_capacity) {
++            self.overflowed = true;
++            return;
++        }
++        var row = candidate;
++        row.declaration_ordinal = row.declaration_ordinal orelse self.len;
++        self.rows[self.len] = row;
++        self.len += 1;
++    }
++
++    fn markHostResolution(self: *PartitionMemberTable, io: Io) void {
++        self.mutex.lockUncancelable(io);
++        defer self.mutex.unlock(io);
++        self.host_resolution = true;
++    }
++
++    fn markOverflow(self: *PartitionMemberTable, io: Io) void {
++        self.mutex.lockUncancelable(io);
++        defer self.mutex.unlock(io);
++        self.overflowed = true;
++    }
++
++    fn explicitObservation(
++        self: *PartitionMemberTable,
++        io: Io,
++        declaration_ordinal: u32,
++    ) ?PartitionMemberObservation {
++        self.mutex.lockUncancelable(io);
++        defer self.mutex.unlock(io);
++        for (self.rows[0..self.len]) |row| {
++            if (row.declaration_source != .explicit or
++                row.declaration_ordinal.? != declaration_ordinal)
++            {
++                continue;
++            }
++            return .{
++                .content = row.content.?,
++                .thin_archive = row.thin_archive,
++            };
++        }
++        return null;
++    }
++
++    fn copy(
++        self: *PartitionMemberTable,
++        io: Io,
++        output: *[partition_member_capacity]PartitionMemberCandidate,
++    ) PartitionMemberCapture {
++        self.mutex.lockUncancelable(io);
++        defer self.mutex.unlock(io);
++        @memcpy(output[0..self.len], self.rows[0..self.len]);
++        return .{
++            .recorded = self.len,
++            .overflowed = self.overflowed,
++            .host_resolution = self.host_resolution,
++        };
++    }
++};
++
+ pub const OpenError = Allocator.Error || std.DynLib.Error ||
+     api.CompatibilityError || error{
+     MissingDescriptor,
+@@ -86,6 +435,7 @@ pub const Plugin = struct {
+     opened: bool = false,
+     update_started: bool = false,
+     claims: ClaimTable = .{},
++    partition_members: PartitionMemberTable = .{},
+
+     pub const empty: Plugin = .{};
+
+@@ -100,6 +450,7 @@ pub const Plugin = struct {
+         _ = discardStage(host);
+         self.plugin.failure = .empty;
+         self.claims.reset();
++        self.partition_members.reset(host.io);
+         host.stage_limit = 0;
+         host.stage_bytes = 0;
+         host.stage_started = 0;
+@@ -220,8 +571,176 @@ pub const Plugin = struct {
+         self.claims.append(row);
+     }
+
++    pub fn recordPrelinkTask(
++        self: *Plugin,
++        task: anytype,
++        explicit_inputs: anytype,
++    ) !void {
++        const io = self.host_context.io;
++        switch (task) {
++            .load_explicitly_provided => for (
++                explicit_inputs,
++                0..,
++            ) |input, index| {
++                const declaration_ordinal = std.math.cast(u32, index) orelse {
++                    self.partition_members.markOverflow(io);
++                    continue;
++                };
++                switch (input) {
++                    .object => |object| {
++                        const observed = try hashPartitionFile(
++                            io,
++                            object.file,
++                            .object,
++                        );
++                        self.partition_members.append(io, .{
++                            .origin = .explicit,
++                            .kind = .object,
++                            .path = object.path,
++                            .file = object.file,
++                            .content = observed.content,
++                            .thin_archive = observed.thin_archive,
++                            .declaration_source = .explicit,
++                            .declaration_ordinal = declaration_ordinal,
++                            .must_link = object.must_link,
++                            .hidden = object.hidden,
++                        });
++                    },
++                    .archive => |archive| {
++                        const observed = try hashPartitionFile(
++                            io,
++                            archive.file,
++                            .archive,
++                        );
++                        self.partition_members.append(io, .{
++                            .origin = .explicit,
++                            .kind = .archive,
++                            .path = archive.path,
++                            .file = archive.file,
++                            .content = observed.content,
++                            .thin_archive = observed.thin_archive,
++                            .declaration_source = .explicit,
++                            .declaration_ordinal = declaration_ordinal,
++                            .must_link = archive.must_link,
++                            .hidden = archive.hidden,
++                        });
++                    },
++                    .res => |resource| {
++                        const observed = try hashPartitionFile(
++                            io,
++                            resource.file,
++                            .resource,
++                        );
++                        self.partition_members.append(io, .{
++                            .origin = .explicit,
++                            .kind = .resource,
++                            .path = resource.path,
++                            .file = resource.file,
++                            .content = observed.content,
++                            .thin_archive = observed.thin_archive,
++                            .declaration_source = .explicit,
++                            .declaration_ordinal = declaration_ordinal,
++                        });
++                    },
++                    .dso => |shared_library| {
++                        const observed = try hashPartitionFile(
++                            io,
++                            shared_library.file,
++                            .shared_library,
++                        );
++                        self.partition_members.append(io, .{
++                            .origin = .explicit,
++                            .kind = .shared_library,
++                            .path = shared_library.path,
++                            .file = shared_library.file,
++                            .content = observed.content,
++                            .thin_archive = observed.thin_archive,
++                            .declaration_source = .explicit,
++                            .declaration_ordinal = declaration_ordinal,
++                            .needed = shared_library.needed,
++                            .weak = shared_library.weak,
++                            .reexport = shared_library.reexport,
++                        });
++                    },
++                    .dso_exact => {},
++                }
++            },
++            .load_host_libc => self.partition_members.markHostResolution(io),
++            .load_object => |object| {
++                const origin = partitionMemberOrigin(object.origin) orelse
++                    return;
++                self.partition_members.append(io, .{
++                    .origin = origin,
++                    .kind = .object,
++                    .path = object.path,
++                    .child = generatedChildRole(object.child),
++                });
++            },
++            .load_archive => |archive| {
++                const origin = partitionMemberOrigin(archive.origin) orelse
++                    return;
++                self.partition_members.append(io, .{
++                    .origin = origin,
++                    .kind = .archive,
++                    .path = archive.path,
++                    .child = generatedChildRole(archive.child),
++                    .must_link = archive.must_link,
++                });
++            },
++            .load_dso => |dso| {
++                const origin = partitionMemberOrigin(dso.origin) orelse
++                    return;
++                self.partition_members.append(io, .{
++                    .origin = origin,
++                    .kind = .shared_library,
++                    .path = dso.path,
++                    .child = generatedChildRole(dso.child),
++                });
++            },
++        }
++    }
++
++    pub fn confirmExplicitInput(
++        self: *Plugin,
++        input: anytype,
++        index: usize,
++    ) !void {
++        const declaration_ordinal = std.math.cast(u32, index) orelse return;
++        const expected = self.partition_members.explicitObservation(
++            self.host_context.io,
++            declaration_ordinal,
++        ) orelse return;
++        const observed = switch (input) {
++            .object => |object| try hashPartitionFile(
++                self.host_context.io,
++                object.file,
++                .object,
++            ),
++            .archive => |archive| try hashPartitionFile(
++                self.host_context.io,
++                archive.file,
++                .archive,
++            ),
++            .res => |resource| try hashPartitionFile(
++                self.host_context.io,
++                resource.file,
++                .resource,
++            ),
++            .dso => |shared_library| try hashPartitionFile(
++                self.host_context.io,
++                shared_library.file,
++                .shared_library,
++            ),
++            .dso_exact => return,
++        };
++        if (!partitionObservationEql(expected, observed)) {
++            return error.PartitionMemberChangedDuringLink;
++        }
++    }
++
+     pub fn flush(
+         self: *Plugin,
++        comp: anytype,
+         zcu: *const Zcu,
+         tid: Zcu.PerThread.Id,
+     ) CallbackError!void {
+@@ -268,6 +787,14 @@ pub const Plugin = struct {
+         }
+         self.host_context.stage_started = 0;
+         self.host_context.stage_failed = false;
++        self.publishPartitionCensus(comp) catch |err| {
++            self.plugin.failure.set(
++                .publish,
++                "partition census publication failed: {t}",
++                .{err},
++            );
++            return error.PluginFailed;
++        };
+         self.update_started = false;
+     }
+
+@@ -397,6 +924,412 @@ pub const Plugin = struct {
+         return candidate[basename.len..];
+     }
+
++    fn publishPartitionCensus(self: *Plugin, comp: anytype) !void {
++        const host = self.host_context;
++        var path_storage: [Io.Dir.max_path_bytes]u8 = undefined;
++        const path = try std.fmt.bufPrint(
++            &path_storage,
++            "{s}{s}",
++            .{ host.output_path, partition_census_suffix },
++        );
++        const unit_identity = comp.config.stardust_unit_identity orelse
++            api.fork_identity;
++        const inputs = try inputCounts(comp.link_inputs);
++        if (comp.bin_file != null) {
++            try self.recordWin32Resources(comp.win32_resources.items);
++        }
++        var member_candidates: [partition_member_capacity]PartitionMemberCandidate =
++            undefined;
++        const member_capture = self.partition_members.copy(
++            host.io,
++            &member_candidates,
++        );
++        var member_identities: [partition_member_capacity]PartitionMemberIdentity =
++            undefined;
++        for (
++            member_candidates[0..member_capture.recorded],
++            0..,
++        ) |candidate, index| {
++            const observed = try hashPartitionMember(host.io, candidate);
++            member_identities[index] = .{
++                .declaration = partitionDeclarationIdentity(
++                    unit_identity,
++                    candidate,
++                ),
++                .origin = candidate.origin,
++                .kind = candidate.kind,
++                .bytes = observed.content.bytes,
++                .sha256 = observed.content.sha256,
++                .occurrences = 1,
++                .child = if (candidate.child) |role|
++                    try hashGeneratedChild(
++                        host.io,
++                        host.output_path,
++                        role,
++                    )
++                else
++                    null,
++                .must_link = candidate.must_link,
++                .hidden = candidate.hidden,
++                .needed = candidate.needed,
++                .weak = candidate.weak,
++                .reexport = candidate.reexport,
++                .exact_authority = candidate.file != null and
++                    candidate.origin != .unknown and
++                    candidate.kind != .shared_library,
++                .thin_archive = observed.thin_archive,
++            };
++        }
++        const recorded_member_identities =
++            member_identities[0..member_capture.recorded];
++        std.mem.sort(
++            PartitionMemberIdentity,
++            recorded_member_identities,
++            {},
++            PartitionMemberIdentity.lessThan,
++        );
++        for (recorded_member_identities, 0..) |identity, index| {
++            if (index > 0 and std.mem.eql(
++                u8,
++                &recorded_member_identities[index - 1].declaration,
++                &identity.declaration,
++            )) return error.DuplicatePartitionDeclaration;
++        }
++        const member_count: usize = member_capture.recorded;
++        var member_hex: [partition_member_capacity][Sha256.digest_length * 2]u8 =
++            undefined;
++        var declaration_hex: [partition_member_capacity][Sha256.digest_length * 2]u8 =
++            undefined;
++        var child_snapshot_hex: [partition_member_capacity][Sha256.digest_length * 2]u8 =
++            undefined;
++        var child_partition_census_hex: [partition_member_capacity][Sha256.digest_length * 2]u8 =
++            undefined;
++        var member_json: [partition_member_capacity]PartitionMemberJson =
++            undefined;
++        var all_members_exact = true;
++        var explicit_member_count: u32 = 0;
++        for (member_identities[0..member_count], 0..) |identity, index| {
++            all_members_exact = all_members_exact and
++                identity.exact_authority and !identity.thin_archive;
++            if (identity.origin == .explicit) {
++                explicit_member_count = try increment(explicit_member_count);
++            }
++            member_hex[index] = std.fmt.bytesToHex(identity.sha256, .lower);
++            declaration_hex[index] = std.fmt.bytesToHex(
++                identity.declaration,
++                .lower,
++            );
++            const child: ?GeneratedChildJson = if (identity.child) |value| child: {
++                child_snapshot_hex[index] = std.fmt.bytesToHex(
++                    value.snapshot.sha256,
++                    .lower,
++                );
++                child_partition_census_hex[index] = std.fmt.bytesToHex(
++                    value.partition_census.sha256,
++                    .lower,
++                );
++                break :child .{
++                    .role = value.role,
++                    .snapshot = .{
++                        .bytes = value.snapshot.bytes,
++                        .sha256 = child_snapshot_hex[index][0..],
++                    },
++                    .partition_census = .{
++                        .bytes = value.partition_census.bytes,
++                        .sha256 = child_partition_census_hex[index][0..],
++                    },
++                };
++            } else null;
++            member_json[index] = .{
++                .ordinal = try count32(index),
++                .declaration = declaration_hex[index][0..],
++                .origin = identity.origin,
++                .kind = identity.kind,
++                .bytes = identity.bytes,
++                .sha256 = member_hex[index][0..],
++                .occurrences = identity.occurrences,
++                .must_link = identity.must_link,
++                .hidden = identity.hidden,
++                .needed = identity.needed,
++                .weak = identity.weak,
++                .reexport = identity.reexport,
++                .child = child,
++            };
++        }
++        const snapshot_content = try hashPath(
++            host.io,
++            CachePath.initCwd(host.output_path),
++        );
++        const snapshot_hex = std.fmt.bytesToHex(snapshot_content.sha256, .lower);
++        var output_hex: [Sha256.digest_length * 2]u8 = undefined;
++        const output: ?PartitionContentJson = if (comp.bin_file) |file| output: {
++            const content = try hashPath(host.io, file.emit);
++            output_hex = std.fmt.bytesToHex(content.sha256, .lower);
++            break :output .{
++                .bytes = content.bytes,
++                .sha256 = output_hex[0..],
++            };
++        } else null;
++        const backend_supported = if (comp.bin_file) |file| switch (file.tag) {
++            .coff2, .elf, .elf2, .wasm, .lld => true,
++            .macho, .c, .spirv, .plan9 => false,
++        } else false;
++        const dynamic_linker =
++            comp.root_mod.resolved_target.result.dynamic_linker.get() != null;
++        const explicit_input_count = try std.math.add(
++            u32,
++            try std.math.add(u32, inputs.object, inputs.archive),
++            try std.math.add(u32, inputs.resource, inputs.shared_library),
++        );
++        const runtime_absent = comp.libcxx_static_lib == null and
++            comp.libcxxabi_static_lib == null and
++            comp.libunwind_static_lib == null and
++            comp.tsan_lib == null and
++            comp.ubsan_rt_lib == null and
++            comp.ubsan_rt_obj == null and
++            comp.zigc_static_lib == null and
++            comp.compiler_rt_lib == null and
++            comp.compiler_rt_obj == null and
++            comp.fuzzer_lib == null;
++        const built_shared_objects_absent = comp.glibc_so_files == null and
++            comp.freebsd_so_files == null and
++            comp.netbsd_so_files == null and
++            comp.openbsd_so_files == null;
++        const external_members_authenticated =
++            comp.config.stardust_unit_identity != null and
++            comp.bin_file != null and
++            backend_supported and
++            comp.config.link_mode == .static and
++            !dynamic_linker and
++            !comp.config.link_libc and
++            inputs.shared_library == 0 and
++            inputs.exact_shared_library == 0 and
++            comp.c_objects.items.len == 0 and
++            comp.win32_resources.items.len == 0 and
++            comp.windows_libs.count() == 0 and
++            comp.crt_files.count() == 0 and
++            runtime_absent and
++            built_shared_objects_absent and
++            explicit_member_count == explicit_input_count and
++            !member_capture.overflowed and
++            !member_capture.host_resolution and
++            all_members_exact;
++        const census = .{
++            .schema = partition_census_schema,
++            .unit = unit_identity,
++            .compiler_source = api.source_identity,
++            .compiler_fork = api.fork_identity,
++            .output_mode = @tagName(comp.config.output_mode),
++            .link_mode = @tagName(comp.config.link_mode),
++            .linker = if (comp.bin_file) |file| @tagName(file.tag) else null,
++            .is_test = comp.config.is_test,
++            .has_zcu = comp.zcu != null,
++            .emits_binary = comp.bin_file != null,
++            .link_libc = comp.config.link_libc,
++            .skip_linker_dependencies = comp.skip_linker_dependencies,
++            .dynamic_linker = dynamic_linker,
++            .inputs = inputs,
++            .c_objects = try count32(comp.c_objects.items.len),
++            .win32_resources = try count32(comp.win32_resources.items.len),
++            .windows_libraries = try count32(comp.windows_libs.count()),
++            .crt_files = try count32(comp.crt_files.count()),
++            .compiler_rt_strategy = @tagName(comp.compiler_rt_strat),
++            .ubsan_rt_strategy = @tagName(comp.ubsan_rt_strat),
++            .zigc_strategy = @tagName(comp.zigc_strat),
++            .runtime = .{
++                .libcxx_static = comp.libcxx_static_lib != null,
++                .libcxxabi_static = comp.libcxxabi_static_lib != null,
++                .libunwind_static = comp.libunwind_static_lib != null,
++                .tsan = comp.tsan_lib != null,
++                .ubsan_lib = comp.ubsan_rt_lib != null,
++                .ubsan_object = comp.ubsan_rt_obj != null,
++                .zigc_static = comp.zigc_static_lib != null,
++                .compiler_rt_lib = comp.compiler_rt_lib != null,
++                .compiler_rt_object = comp.compiler_rt_obj != null,
++                .fuzzer = comp.fuzzer_lib != null,
++            },
++            .built_shared_objects = .{
++                .glibc = comp.glibc_so_files != null,
++                .freebsd = comp.freebsd_so_files != null,
++                .netbsd = comp.netbsd_so_files != null,
++                .openbsd = comp.openbsd_so_files != null,
++            },
++            .snapshot = PartitionContentJson{
++                .bytes = snapshot_content.bytes,
++                .sha256 = snapshot_hex[0..],
++            },
++            .output = output,
++            .external_members = .{
++                .authenticated = external_members_authenticated,
++                .backend_supported = backend_supported,
++                .recorded = try count32(member_count),
++                .occurrences = member_capture.recorded,
++                .overflowed = member_capture.overflowed,
++                .host_resolution = member_capture.host_resolution,
++                .values = member_json[0..member_count],
++            },
++        };
++
++        var atomic = try Io.Dir.cwd().createFileAtomic(
++            host.io,
++            path,
++            .{ .replace = true },
++        );
++        defer atomic.deinit(host.io);
++        var write_storage: [4096]u8 = undefined;
++        var file_writer = atomic.file.writer(host.io, &write_storage);
++        try std.json.Stringify.value(census, .{}, &file_writer.interface);
++        try file_writer.interface.flush();
++        try atomic.file.sync(host.io);
++        try atomic.replace(host.io);
++    }
++
++    fn recordWin32Resources(self: *Plugin, resources: anytype) !void {
++        for (resources, 0..) |resource, index| {
++            if (comptime @hasField(@TypeOf(resource.*), "status")) {
++                switch (resource.status) {
++                    .success => |success| self.partition_members.append(
++                        self.host_context.io,
++                        .{
++                            .origin = .foreign,
++                            .kind = .resource,
++                            .path = CachePath.initCwd(success.res_path),
++                            .declaration_source = .win32_resource,
++                            .declaration_ordinal = try count32(index),
++                        },
++                    ),
++                    else => return error.PartitionResourceUnavailable,
++                }
++            }
++        }
++    }
++
++    fn hashGeneratedChild(
++        io: Io,
++        parent: []const u8,
++        role: GeneratedChildRole,
++    ) !GeneratedChildIdentity {
++        var snapshot_path_storage: [Io.Dir.max_path_bytes]u8 = undefined;
++        const snapshot_path = try std.fmt.bufPrint(
++            &snapshot_path_storage,
++            "{s}.member-{s}.choir",
++            .{ parent, @tagName(role) },
++        );
++        var census_path_storage: [Io.Dir.max_path_bytes]u8 = undefined;
++        const census_path = try std.fmt.bufPrint(
++            &census_path_storage,
++            "{s}{s}",
++            .{ snapshot_path, partition_census_suffix },
++        );
++        return .{
++            .role = role,
++            .snapshot = try hashPath(io, CachePath.initCwd(snapshot_path)),
++            .partition_census = try hashPath(
++                io,
++                CachePath.initCwd(census_path),
++            ),
++        };
++    }
++
++    fn hashPath(io: Io, path: CachePath) !PartitionContentIdentity {
++        const file = try path.root_dir.handle.openFile(
++            io,
++            path.sub_path,
++            .{ .allow_directory = false },
++        );
++        defer file.close(io);
++        return hashFile(io, file);
++    }
++
++    fn hashPartitionMember(
++        io: Io,
++        candidate: PartitionMemberCandidate,
++    ) !PartitionMemberObservation {
++        if (candidate.content) |content| return .{
++            .content = content,
++            .thin_archive = candidate.thin_archive,
++        };
++        const file = try candidate.path.root_dir.handle.openFile(
++            io,
++            candidate.path.sub_path,
++            .{ .allow_directory = false },
++        );
++        defer file.close(io);
++        return hashPartitionFile(io, file, candidate.kind);
++    }
++
++    fn hashPartitionFile(
++        io: Io,
++        file: Io.File,
++        kind: PartitionMemberKind,
++    ) !PartitionMemberObservation {
++        return .{
++            .content = try hashFile(io, file),
++            .thin_archive = kind == .archive and try isThinArchive(io, file),
++        };
++    }
++
++    fn isThinArchive(io: Io, file: Io.File) !bool {
++        const thin_magic = "!<thin>\n";
++        var observed: [thin_magic.len]u8 = undefined;
++        const read = try file.readPositionalAll(io, &observed, 0);
++        return read == observed.len and std.mem.eql(u8, &observed, thin_magic);
++    }
++
++    fn hashFile(io: Io, file: Io.File) !PartitionContentIdentity {
++        const stat = try file.stat(io);
++        if (stat.kind != .file) return error.PartitionMemberNotRegularFile;
++
++        var hasher = Sha256.init(.{});
++        var buffer: [partition_hash_buffer_bytes]u8 = undefined;
++        var offset: u64 = 0;
++        while (offset < stat.size) {
++            const remaining = stat.size - offset;
++            const requested: usize = @intCast(@min(remaining, buffer.len));
++            const read = try file.readPositional(
++                io,
++                &.{buffer[0..requested]},
++                offset,
++            );
++            if (read == 0) return error.PartitionMemberTruncatedDuringHash;
++            hasher.update(buffer[0..read]);
++            offset = try std.math.add(u64, offset, read);
++        }
++        var extra: [1]u8 = undefined;
++        if (try file.readPositional(io, &.{&extra}, offset) != 0) {
++            return error.PartitionMemberGrewDuringHash;
++        }
++        var digest: [Sha256.digest_length]u8 = undefined;
++        hasher.final(&digest);
++        return .{ .bytes = stat.size, .sha256 = digest };
++    }
++
++    fn inputCounts(inputs: anytype) !PartitionInputCounts {
++        var result = PartitionInputCounts{};
++        for (inputs) |input| switch (input) {
++            .object => result.object = try increment(result.object),
++            .archive => result.archive = try increment(result.archive),
++            .res => result.resource = try increment(result.resource),
++            .dso => result.shared_library = try increment(
++                result.shared_library,
++            ),
++            .dso_exact => result.exact_shared_library = try increment(
++                result.exact_shared_library,
++            ),
++        };
++        return result;
++    }
++
++    fn count32(value: usize) !u32 {
++        return std.math.cast(u32, value) orelse
++            error.PartitionCensusCapacityExceeded;
++    }
++
++    fn increment(value: u32) !u32 {
++        return std.math.add(u32, value, 1) catch
++            error.PartitionCensusCapacityExceeded;
++    }
++
+     fn fromContext(context: ?*anyopaque) *HostContext {
+         return @ptrCast(@alignCast(context.?));
+     }

@@ -1,0 +1,47 @@
+const namespace = @import("root.zig");
+const std = @import("std");
+const document = @import("document.zig");
+const escape = @import("escape.zig");
+const field = @import("field.zig");
+const format = @import("format.zig");
+const scalar = @import("scalar.zig");
+const sort = @import("sort.zig");
+const stream = @import("stream.zig");
+
+const Field = namespace.Field;
+const Style = namespace.Style;
+const Writer = namespace.Writer;
+const Object = namespace.Object;
+const Array = namespace.Array;
+const writeString = namespace.writeString;
+const writeStringParts = namespace.writeStringParts;
+const stringAlloc = namespace.stringAlloc;
+const writeMinified = namespace.writeMinified;
+const renderMinifiedAlloc = namespace.renderMinifiedAlloc;
+const writeIndented = namespace.writeIndented;
+const renderIndentedAlloc = namespace.renderIndentedAlloc;
+const writeSortedMinified = namespace.writeSortedMinified;
+const renderSortedMinifiedAlloc = namespace.renderSortedMinifiedAlloc;
+const writeNull = namespace.writeNull;
+const writeBool = namespace.writeBool;
+const writeInt = namespace.writeInt;
+const writeNumberString = namespace.writeNumberString;
+const writeFieldName = namespace.writeFieldName;
+const writeFieldString = namespace.writeFieldString;
+const writeFieldOptionalString = namespace.writeFieldOptionalString;
+const writeFieldBool = namespace.writeFieldBool;
+const writeFieldInt = namespace.writeFieldInt;
+const writeFieldRaw = namespace.writeFieldRaw;
+const valueDoc = namespace.valueDoc;
+const renderValueAlloc = namespace.renderValueAlloc;
+const writeValue = namespace.writeValue;
+const writeValueWithState = namespace.writeValueWithState;
+test {
+    std.testing.refAllDecls(document);
+    std.testing.refAllDecls(escape);
+    std.testing.refAllDecls(field);
+    std.testing.refAllDecls(format);
+    std.testing.refAllDecls(scalar);
+    std.testing.refAllDecls(sort);
+    std.testing.refAllDecls(stream);
+}

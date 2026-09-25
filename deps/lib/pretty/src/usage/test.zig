@@ -1,0 +1,71 @@
+const namespace = @import("root.zig");
+const std = @import("std");
+
+const pretty = namespace.pretty;
+const command = namespace.command;
+const types = namespace.types;
+const terminal = namespace.terminal;
+const render = namespace.render;
+const UsageTextStyles = namespace.UsageTextStyles;
+const UsageTextOptions = namespace.UsageTextOptions;
+const HelpStyles = namespace.HelpStyles;
+const HelpOptions = namespace.HelpOptions;
+const TerminalOptions = namespace.TerminalOptions;
+const ErrorTextOptions = namespace.ErrorTextOptions;
+const HelpErrorOptions = namespace.HelpErrorOptions;
+const CommandSuggestionOptions = namespace.CommandSuggestionOptions;
+const CommandSuggestion = namespace.CommandSuggestion;
+const CommandSuggestionWriteOptions = namespace.CommandSuggestionWriteOptions;
+const CommandHelpErrorOptions = namespace.CommandHelpErrorOptions;
+const CommandPathHelpErrorOptions = namespace.CommandPathHelpErrorOptions;
+const Help = namespace.Help;
+const CommandPathMissing = namespace.CommandPathMissing;
+const Usage = namespace.Usage;
+const CommandUsage = namespace.CommandUsage;
+const BuildUsage = namespace.BuildUsage;
+const CommandGroup = namespace.CommandGroup;
+const Command = namespace.Command;
+const Argument = namespace.Argument;
+const Option = namespace.Option;
+const OptionGroup = namespace.OptionGroup;
+const Section = namespace.Section;
+const SectionRow = namespace.SectionRow;
+const Example = namespace.Example;
+const isHelpArg = namespace.isHelpArg;
+const hasHelpArg = namespace.hasHelpArg;
+const suggestionDistance = namespace.suggestionDistance;
+const Terminal = namespace.Terminal;
+const layoutOptions = namespace.layoutOptions;
+const terminalWidth = namespace.terminalWidth;
+const terminalColorMode = namespace.terminalColorMode;
+const writeStdoutUsageText = namespace.writeStdoutUsageText;
+const writeStderrUsageText = namespace.writeStderrUsageText;
+const writeStdoutHelp = namespace.writeStdoutHelp;
+const writeStderrHelp = namespace.writeStderrHelp;
+const writeFileUsageText = namespace.writeFileUsageText;
+const writeFileUsageTextFmt = namespace.writeFileUsageTextFmt;
+const writeFileHelp = namespace.writeFileHelp;
+const writeFileErrorText = namespace.writeFileErrorText;
+const writeFileErrorTextFmt = namespace.writeFileErrorTextFmt;
+const writeFileWarningText = namespace.writeFileWarningText;
+const writeFileWarningTextFmt = namespace.writeFileWarningTextFmt;
+const writeUsageText = namespace.writeUsageText;
+const writeHelp = namespace.writeHelp;
+const writeHelpError = namespace.writeHelpError;
+const writeCommandHelpOrError = namespace.writeCommandHelpOrError;
+const writeCommandPathHelpOrError = namespace.writeCommandPathHelpOrError;
+const writeCommandSuggestion = namespace.writeCommandSuggestion;
+const renderUsageTextAlloc = namespace.renderUsageTextAlloc;
+const renderHelpAlloc = namespace.renderHelpAlloc;
+const writeErrorText = namespace.writeErrorText;
+const renderErrorTextAlloc = namespace.renderErrorTextAlloc;
+test {
+    _ = @import("command/test.zig");
+}
+
+test "pretty usage package namespace" {
+    _ = command;
+    std.testing.refAllDecls(types);
+    std.testing.refAllDecls(terminal);
+    std.testing.refAllDecls(render);
+}

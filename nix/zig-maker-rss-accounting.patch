@@ -1,0 +1,11 @@
+diff --git a/lib/compiler/Maker.zig b/lib/compiler/Maker.zig
+--- a/lib/compiler/Maker.zig
++++ b/lib/compiler/Maker.zig
+@@ -2472,6 +2472,7 @@
+                 const candidate_max_rss = candidate_index.ptr(c).max_rss.toBytes();
+                 if (maker.available_rss < candidate_max_rss) break;
+                 assert(maker.memory_blocked_steps.pop() == candidate_index);
++                maker.available_rss -= candidate_max_rss;
+                 dispatch_set.appendAssumeCapacity(candidate_index);
+             }
+         }

@@ -1,0 +1,6 @@
+nix/zig-target-options.patch
+nix/zig-stardust-observer.patch
+nix/zig-stardust-partition-census.patch
+nix/zig-generation-events.patch
+nix/zig-llvm-underaligned-layout.patch
+nix/zig-maker-rss-accounting.patch

@@ -1,0 +1,21 @@
+pub const command = @import("command.zig");
+const options = @import("options.zig");
+const reader = @import("reader.zig");
+const stats = @import("stats/root.zig");
+
+pub const Options = options.Options;
+pub const Dataset = reader.Dataset;
+pub const Result = stats.Result;
+pub const Verdict = stats.Verdict;
+pub const ComparisonLimits = stats.ComparisonLimits;
+pub const ComparisonCapacity = stats.ComparisonCapacity;
+pub const ComparisonCapacityError = stats.ComparisonCapacityError;
+pub const ComparisonStorage = stats.ComparisonStorage;
+pub const ComparisonStorageStatus = stats.ComparisonStorageStatus;
+pub const ComparisonStorageExhaustion = stats.ComparisonStorageExhaustion;
+pub const ComparisonError = stats.ComparisonError;
+pub const parseOptions = options.parse;
+pub const parseDataset = reader.parse;
+pub const compareSeries = stats.compareSeries;
+pub const run = command.run;
+pub const usage_text = command.usage_text;
