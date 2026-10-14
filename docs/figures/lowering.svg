@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 342" role="img" aria-labelledby="t d">
+<title id="t">One power operation becomes five multiplications that reuse x to the fourth</title>
+<desc id="d">Top: the function power13 as the author writes it, an input x, one calc.powi operation with exponent 13, and return. Bottom: the same function after the author's rewrite, with each value named as Choir prints it. Five arith.mul operations compute x squared (%2), x to the fourth (%3), x to the fifth (%4), x to the eighth (%5), and x to the thirteenth (%6), which is returned; x is %1. Each arrow is one operand. x to the fourth, marked in red, is an operand three times: once in x times x to the fourth, and twice in x to the fourth times itself.</desc>
+<defs><marker id="h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0,1 L10,5 L0,9 z"/></marker><marker id="ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head acc-fill" d="M0,1 L10,5 L0,9 z"/></marker></defs>
+<style>
+.h{font:15px 'Century Supra','Century Schoolbook','New Century Schoolbook',Georgia,serif;fill:#1a1714}
+.t{font:14px 'Century Supra','Century Schoolbook','New Century Schoolbook',Georgia,serif;fill:#564e44}
+.c{font:15px ui-monospace,'SF Mono',Menlo,Consolas,monospace;fill:#1a1714}
+.cs{font:14px ui-monospace,'SF Mono',Menlo,Consolas,monospace;fill:#1a1714}
+.cm{font:14px ui-monospace,'SF Mono',Menlo,Consolas,monospace;fill:#564e44}
+.acc{fill:#d2371f}
+.gone{opacity:0.7}
+.user{fill:#ece8dd;stroke:#1a1714;stroke-width:1.4}
+.made{fill:#ece8dd;stroke:#564e44;stroke-width:1.2;stroke-dasharray:4 3}
+.made.hot{stroke:#d2371f;stroke-width:1.6}
+.line{fill:none;stroke:#564e44;stroke-width:1.2}
+.line.hot{stroke:#d2371f;stroke-width:1.5}
+.strike{stroke:#564e44;stroke-width:1.2}
+.head{fill:#564e44} .acc-fill{fill:#d2371f}
+.rule{stroke:rgba(26,23,20,0.3);stroke-width:1}
+@media (prefers-color-scheme: dark){
+.h,.c,.cs{fill:#ece3d2} .t,.cm{fill:#b0a692} .acc{fill:#fe5a44}
+.user{fill:#1e1b15;stroke:#ece3d2} .made{fill:#1e1b15;stroke:#b0a692}
+.made.hot{stroke:#fe5a44} .line{stroke:#b0a692} .line.hot{stroke:#fe5a44}
+.strike{stroke:#b0a692} .head{fill:#b0a692} .acc-fill{fill:#fe5a44}
+.rule{stroke:rgba(236,227,210,0.28)}
+}
+</style>
+<text class="h" x="0" y="18">The author writes</text>
+<text class="c" x="60" y="71" text-anchor="middle">x</text>
+<rect class="user" x="148" y="42" width="444" height="48" rx="3"/>
+<text class="c" x="370" y="62" text-anchor="middle">calc.powi(x)</text>
+<text class="c" x="370" y="82" text-anchor="middle">exponent = 13</text>
+<path class="line" d="M76,66 L144,66" marker-end="url(#h)"/>
+<path class="line" d="M592,66 L628,66" marker-end="url(#h)"/>
+<text class="c" x="660" y="71" text-anchor="middle">return</text>
+<line class="rule" x1="0" y1="118" x2="720" y2="118"/>
+<text class="h" x="0" y="146">After the author’s rewrite into <tspan class="c">arith.mul</tspan></text>
+<path class="line" d="M92.0,229.0 L144.0,229.0" marker-end="url(#h)"/>
+<path class="line" d="M92.0,243.0 L144.0,243.0" marker-end="url(#h)"/>
+<path class="line" d="M212.0,229.0 L264.0,229.0" marker-end="url(#h)"/>
+<path class="line" d="M212.0,243.0 L264.0,243.0" marker-end="url(#h)"/>
+<path class="line" d="M60.0,214.0 C60.0,138.0 310.0,178.0 394.0,178.0" marker-end="url(#h)"/>
+<path class="line hot" d="M332.0,221.7 L394.0,194.1" marker-end="url(#ha)"/>
+<path class="line hot" d="M334.9,243.9 L396.9,271.5" marker-end="url(#ha)"/>
+<path class="line hot" d="M329.1,256.7 L391.1,284.3" marker-end="url(#ha)"/>
+<path class="line" d="M462.0,192.3 L524.0,219.9" marker-end="url(#h)"/>
+<path class="line" d="M462.0,279.7 L524.0,252.1" marker-end="url(#h)"/>
+<path class="line" d="M592.0,236 L628,236" marker-end="url(#h)"/>
+<text class="c" x="660" y="241" text-anchor="middle">return</text>
+<text class="c" x="60" y="241" text-anchor="middle">x</text>
+<text class="cm" x="60" y="272" text-anchor="middle">%1</text>
+<rect class="made" x="148.0" y="218.0" width="64" height="36" rx="3"/>
+<text class="c" x="180" y="241" text-anchor="middle">x²</text>
+<text class="cm" x="180" y="272" text-anchor="middle">%2</text>
+<rect class="made hot" x="268.0" y="218.0" width="64" height="36" rx="3"/>
+<text class="c acc" x="300" y="241" text-anchor="middle">x⁴</text>
+<text class="cs acc" x="300" y="272" text-anchor="middle">%3</text>
+<rect class="made" x="398.0" y="160.0" width="64" height="36" rx="3"/>
+<text class="c" x="430" y="183" text-anchor="middle">x⁵</text>
+<text class="cm" x="430" y="214" text-anchor="middle">%4</text>
+<rect class="made" x="398.0" y="276.0" width="64" height="36" rx="3"/>
+<text class="c" x="430" y="299" text-anchor="middle">x⁸</text>
+<text class="cm" x="430" y="330" text-anchor="middle">%5</text>
+<rect class="made" x="528.0" y="218.0" width="64" height="36" rx="3"/>
+<text class="c" x="560" y="241" text-anchor="middle">x¹³</text>
+<text class="cm" x="560" y="272" text-anchor="middle">%6</text>
+</svg>

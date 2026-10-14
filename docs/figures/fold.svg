@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 366" role="img" aria-labelledby="t d">
+<title id="t">Folding performs two13's multiplications during compilation, and one constant remains</title>
+<desc id="d">Three listings of the function two13, each named as Choir prints that function alone. Left, after lowering: %1 = arith.constant 2, five arith.mul operations %2 to %6, and func.return(%6), with the value of each operation beside it: 2, 4, 16, 32, 256, and 8192. Upper right, after constant folding: six constants 2, 4, 16, 32, 256, and 8192, and func.return(%6). Only the constant 8192, in red, has a use; the other five have none and are faded. Lower right, after dead-code elimination: %1 = arith.constant 8192 and func.return(%1).</desc>
+<defs><marker id="h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0,1 L10,5 L0,9 z"/></marker><marker id="ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head acc-fill" d="M0,1 L10,5 L0,9 z"/></marker></defs>
+<style>
+.h{font:15px 'Century Supra','Century Schoolbook','New Century Schoolbook',Georgia,serif;fill:#1a1714}
+.t{font:14px 'Century Supra','Century Schoolbook','New Century Schoolbook',Georgia,serif;fill:#564e44}
+.c{font:15px ui-monospace,'SF Mono',Menlo,Consolas,monospace;fill:#1a1714}
+.cs{font:14px ui-monospace,'SF Mono',Menlo,Consolas,monospace;fill:#1a1714}
+.cm{font:14px ui-monospace,'SF Mono',Menlo,Consolas,monospace;fill:#564e44}
+.acc{fill:#d2371f}
+.gone{opacity:0.7}
+.user{fill:#ece8dd;stroke:#1a1714;stroke-width:1.4}
+.made{fill:#ece8dd;stroke:#564e44;stroke-width:1.2;stroke-dasharray:4 3}
+.made.hot{stroke:#d2371f;stroke-width:1.6}
+.line{fill:none;stroke:#564e44;stroke-width:1.2}
+.line.hot{stroke:#d2371f;stroke-width:1.5}
+.strike{stroke:#564e44;stroke-width:1.2}
+.head{fill:#564e44} .acc-fill{fill:#d2371f}
+.rule{stroke:rgba(26,23,20,0.3);stroke-width:1}
+@media (prefers-color-scheme: dark){
+.h,.c,.cs{fill:#ece3d2} .t,.cm{fill:#b0a692} .acc{fill:#fe5a44}
+.user{fill:#1e1b15;stroke:#ece3d2} .made{fill:#1e1b15;stroke:#b0a692}
+.made.hot{stroke:#fe5a44} .line{stroke:#b0a692} .line.hot{stroke:#fe5a44}
+.strike{stroke:#b0a692} .head{fill:#b0a692} .acc-fill{fill:#fe5a44}
+.rule{stroke:rgba(236,227,210,0.28)}
+}
+</style>
+<text class="h" x="0" y="18"><tspan class="c">two13</tspan> after lowering</text>
+<text class="t" x="290" y="46" text-anchor="end">value</text>
+<text class="cs" x="0" y="77">%1 = arith.constant 2</text>
+<text class="cs" x="290" y="77" text-anchor="end">2</text>
+<text class="cs" x="0" y="107">%2 = arith.mul(%1, %1)</text>
+<text class="cs" x="290" y="107" text-anchor="end">4</text>
+<text class="cs" x="0" y="137">%3 = arith.mul(%2, %2)</text>
+<text class="cs" x="290" y="137" text-anchor="end">16</text>
+<text class="cs" x="0" y="167">%4 = arith.mul(%1, %3)</text>
+<text class="cs" x="290" y="167" text-anchor="end">32</text>
+<text class="cs" x="0" y="197">%5 = arith.mul(%3, %3)</text>
+<text class="cs" x="290" y="197" text-anchor="end">256</text>
+<text class="cs" x="0" y="227">%6 = arith.mul(%4, %5)</text>
+<text class="cs acc" x="290" y="227" text-anchor="end">8192</text>
+<text class="cs" x="0" y="257">func.return(%6)</text>
+<line class="rule" x1="326" y1="0" x2="326" y2="366"/>
+<text class="h" x="350" y="18">after constant folding</text>
+<text class="cs gone" x="350" y="77">%1 = arith.constant 2</text>
+<text class="cs gone" x="350" y="107">%2 = arith.constant 4</text>
+<text class="cs gone" x="350" y="137">%3 = arith.constant 16</text>
+<text class="cs gone" x="350" y="167">%4 = arith.constant 32</text>
+<text class="cs gone" x="350" y="197">%5 = arith.constant 256</text>
+<text class="cs" x="350" y="227">%6 = arith.constant 8192</text>
+<path class="line" d="M553.9,64 L559.9,64 L559.9,200 L553.9,200"/>
+<text class="t" x="569.89" y="137">no uses</text>
+<text class="cs" x="350" y="257">func.return(<tspan class="acc">%6</tspan>)</text>
+<path class="line hot" d="M558.3,222 L570.3,222 Q580.3,222 580.3,232 L580.3,242 Q580.3,252 570.3,252 L486.4,252" marker-end="url(#ha)"/>
+<line class="rule" x1="350" y1="274" x2="720" y2="274"/>
+<text class="h" x="350" y="298">after dead-code elimination</text>
+<text class="cs" x="350" y="326">%1 = arith.constant <tspan class="acc">8192</tspan></text>
+<text class="cs" x="350" y="350">func.return(%1)</text>
+</svg>
